@@ -1,0 +1,9 @@
+work/
+*.parquet
+*.bin
+*.pt
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/

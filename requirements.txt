@@ -1,0 +1,6 @@
+pyarrow>=16.0
+duckdb>=1.0
+numpy>=1.26
+torch
+transformer-lens
+pytest
