@@ -136,3 +136,27 @@ class _Interrupt(RuntimeError):
     pass
 
 
+def test_reference_l0_reads_top_level_and_nested(tmp_path):
+    """sae-gpt2-small writes {"metrics": {"l0": ...}}; older runs may write l0 at
+    the top level. Both must be found; absence returns None."""
+    import json as _json
+
+    ckpt = tmp_path / "checkpoint.pt"
+    ckpt.write_bytes(b"")
+    metrics = tmp_path / "metrics.json"
+
+    metrics.write_text(_json.dumps({"l0": 27.5}))
+    assert dump_mod._reference_l0(ckpt) == 27.5
+
+    metrics.write_text(
+        _json.dumps({"run": "topk_x8_k32", "metrics": {"l0": 32.0, "fvu": 0.17}})
+    )
+    assert dump_mod._reference_l0(ckpt) == 32.0
+
+    metrics.write_text(_json.dumps({"metrics": {"fvu": 0.17}}))
+    assert dump_mod._reference_l0(ckpt) is None
+
+    metrics.unlink()
+    assert dump_mod._reference_l0(ckpt) is None
+
+

@@ -87,3 +87,234 @@ class Segment:
         return dict(self.__dict__)
 
 
+@dataclass
+class _Buffers:
+    rows: list[dict[str, np.ndarray]] = field(default_factory=list)
+    tokens: list[dict[str, np.ndarray]] = field(default_factory=list)
+    n_rows: int = 0
+
+
+class SegmentWriter:
+    """Buffers batches and writes paired rows-/tokens- Parquet files."""
+
+    def __init__(
+        self,
+        out_dir: Path,
+        rows_per_file: int,
+        row_group_size: int,
+        next_index: int,
+        seq_cursor: int,
+        token_cursor: int,
+    ) -> None:
+        self.out_dir = out_dir
+        self.rows_per_file = rows_per_file
+        self.row_group_size = row_group_size
+        self.next_index = next_index
+        self._buf = _Buffers()
+        self._seq_start = seq_cursor
+        self._token_start = token_cursor
+        self._seq_end = seq_cursor
+        self._token_end = token_cursor
+
+    @property
+    def pending_rows(self) -> int:
+        return self._buf.n_rows
+
+    def add(
+        self,
+        rows: dict[str, np.ndarray],
+        tokens: dict[str, np.ndarray],
+        seq_end: int,
+        token_end: int,
+    ) -> Segment | None:
+        self._buf.rows.append(rows)
+        self._buf.tokens.append(tokens)
+        self._buf.n_rows += int(rows["token_idx"].shape[0])
+        self._seq_end = seq_end
+        self._token_end = token_end
+        if self._buf.n_rows >= self.rows_per_file:
+            return self.flush()
+        return None
+
+    def _concat(
+        self, parts: list[dict[str, np.ndarray]], sch: pa.Schema
+    ) -> pa.Table:
+        cols = {
+            f.name: np.concatenate([p[f.name] for p in parts])
+            if parts
+            else np.empty(0, dtype=f.type.to_pandas_dtype())
+            for f in sch
+        }
+        return pa.Table.from_pydict(cols, schema=sch)
+
+    def flush(self) -> Segment | None:
+        """Write the pending buffers as one rows file + one tokens file."""
+        if self._token_end == self._token_start:
+            return None  # nothing buffered since the last flush
+        idx = self.next_index
+        rows_name = schema.ROWS_FILE_FMT.format(index=idx)
+        tokens_name = schema.TOKENS_FILE_FMT.format(index=idx)
+        rows_tbl = self._concat(self._buf.rows, schema.ROWS_SCHEMA)
+        tokens_tbl = self._concat(self._buf.tokens, schema.TOKENS_SCHEMA)
+        for name, tbl in ((rows_name, rows_tbl), (tokens_name, tokens_tbl)):
+            pq.write_table(
+                tbl,
+                self.out_dir / name,
+                row_group_size=self.row_group_size,
+                compression=schema.COMPRESSION,
+            )
+        seg = Segment(
+            index=idx,
+            rows_file=rows_name,
+            tokens_file=tokens_name,
+            seq_start=self._seq_start,
+            seq_end=self._seq_end,
+            token_start=self._token_start,
+            token_end=self._token_end,
+            n_rows=self._buf.n_rows,
+        )
+        log.info(
+            "wrote %s (%d rows) + %s (%d tokens)",
+            rows_name,
+            rows_tbl.num_rows,
+            tokens_name,
+            tokens_tbl.num_rows,
+        )
+        self.next_index += 1
+        self._buf = _Buffers()
+        self._seq_start = self._seq_end
+        self._token_start = self._token_end
+        return seg
+
+
+#
+
+
+def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while blob := fh.read(chunk):
+            h.update(blob)
+    return h.hexdigest()
+
+
+def git_sha(path: Path) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _resolve_device(spec: str) -> torch.device:
+    if spec == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(spec)
+
+
+def _load_real_model(name: str, device: torch.device) -> ResidualModel:
+    # transformer_lens is imported lazily so tests injecting a fake model never
+    from transformer_lens import HookedTransformer
+
+    log.info("loading %s via transformer_lens ...", name)
+    model = HookedTransformer.from_pretrained(name)
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def batch_residuals(
+    model: ResidualModel,
+    toks: np.ndarray,
+    hook_name: str,
+    layer: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Forward one batch of sequences to the residual hook. Returns float32
+    ``[n_seqs * (seq_len - 1), d_model]`` with the BOS position dropped, on
+    ``device`` (where the SAE lives)."""
+    model_device = device
+    params = getattr(model, "parameters", None)
+    if callable(params):
+        try:
+            model_device = next(iter(params())).device
+        except (StopIteration, TypeError):
+            pass
+    t = torch.from_numpy(np.ascontiguousarray(toks).astype(np.int64)).to(
+        model_device
+    )
+    ctx = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if model_device.type == "cuda"
+        else contextlib.nullcontext()
+    )
+    with torch.no_grad(), ctx:
+        _, cache = model.run_with_cache(
+            t,
+            names_filter=hook_name,
+            stop_at_layer=layer + 1,
+            return_type=None,
+        )
+    resid = cache[hook_name]
+    resid = resid[:, 1:, :]  # exclude BOS (position 0)
+    return resid.reshape(-1, resid.shape[-1]).float().to(device)
+
+
+def _normalize_sae_config(loaded: LoadedSAE) -> dict[str, Any]:
+    raw = loaded.config
+    input_scale = raw.get("input_scale")
+    if input_scale is None:
+        buf = getattr(loaded.sae, "input_scale", None)
+        if torch.is_tensor(buf) and buf.numel() == 1:
+            input_scale = float(buf.item())
+    expansion = raw.get("expansion", raw.get("expansion_factor"))
+    if expansion is None and loaded.d_model:
+        expansion = loaded.n_features / loaded.d_model
+    return {
+        "activation": raw.get("activation", "relu"),
+        "k": raw.get("k"),
+        "l1_coeff": raw.get("l1_coeff", raw.get("l1_coefficient")),
+        "expansion": expansion,
+        "n_features": loaded.n_features,
+        "d_model": loaded.d_model,
+        "input_scale": input_scale,
+        "raw": raw,
+    }
+
+
+def _reference_l0(checkpoint: Path) -> float | None:
+    metrics_path = checkpoint.parent / "metrics.json"
+    if not metrics_path.is_file():
+        log.warning("no metrics.json next to %s; skipping L0 check", checkpoint)
+        return None
+    try:
+        with metrics_path.open() as fh:
+            metrics = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("could not read %s: %r", metrics_path, exc)
+        return None
+    if isinstance(metrics, dict):
+        # The value may live at the top level or nested one deep under "metrics".
+        scopes = [metrics]
+        sub = metrics.get("metrics")
+        if isinstance(sub, dict):
+            scopes.append(sub)
+        for scope in scopes:
+            for key in _METRICS_L0_KEYS:
+                val = scope.get(key)
+                if isinstance(val, (int, float)):
+                    return float(val)
+    log.warning(
+        "metrics.json at %s has no L0 under %s", metrics_path, _METRICS_L0_KEYS
+    )
+    return None
+
+
+#
+
+
