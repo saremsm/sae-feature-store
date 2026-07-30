@@ -318,3 +318,100 @@ def _reference_l0(checkpoint: Path) -> float | None:
 #
 
 
+@dataclass
+class ResumeState:
+    segments: list[Segment]
+    seq_cursor: int
+    token_cursor: int
+    n_rows: int
+    l0_sum: int
+    complete: bool
+
+
+def _fresh_state() -> ResumeState:
+    return ResumeState([], 0, 0, 0, 0, False)
+
+
+def _load_resume_state(cfg: DumpConfig, ckpt_sha: str) -> ResumeState:
+    meta_path = cfg.out / schema.META_FILENAME
+    if not meta_path.is_file():
+        log.info("--resume: no %s yet; starting fresh", schema.META_FILENAME)
+        return _fresh_state()
+    with meta_path.open() as fh:
+        meta = json.load(fh)
+
+    def _mismatch(what: str, want: Any, have: Any) -> None:
+        raise SystemExit(
+            f"--resume mismatch on {what}: existing run used {have!r}, this "
+            f"invocation uses {want!r}. Use a fresh --out (or delete "
+            f"{cfg.out}) to start over."
+        )
+
+    if meta.get("sae_checkpoint", {}).get("sha256") != ckpt_sha:
+        _mismatch(
+            "checkpoint sha256",
+            ckpt_sha,
+            meta.get("sae_checkpoint", {}).get("sha256"),
+        )
+    if meta.get("shard", {}).get("path") != str(cfg.shard):
+        _mismatch("shard path", str(cfg.shard), meta.get("shard", {}).get("path"))
+    for key, want in (
+        ("n_tokens_requested", cfg.n_tokens),
+        ("rows_per_file", cfg.rows_per_file),
+        ("row_group_size", cfg.row_group_size),
+    ):
+        if meta.get(key) != want:
+            _mismatch(key, want, meta.get(key))
+    run_args = meta.get("progress", {}).get("run_args", {})
+    for key, want in (
+        ("batch_seqs", cfg.batch_seqs),
+        ("encode_chunk", cfg.encode_chunk),
+    ):
+        if run_args.get(key) is not None and run_args.get(key) != want:
+            log.warning(
+                "--resume: %s changed (%r -> %r); values near the resume "
+                "boundary may differ at float precision",
+                key,
+                run_args.get(key),
+                want,
+            )
+
+    segments = [Segment(**{str(k): v for k, v in s.items()}) for s in meta["segments"]]
+    progress = meta["progress"]
+    state = ResumeState(
+        segments=segments,
+        seq_cursor=int(progress["seqs_done"]),
+        token_cursor=int(progress["tokens_done"]),
+        n_rows=int(meta["n_rows"]),
+        l0_sum=int(meta["l0_sum"]),
+        complete=bool(progress["complete"]),
+    )
+
+    # Drop any files not recorded as complete segments (partial writes).
+    known = {s.rows_file for s in segments} | {s.tokens_file for s in segments}
+    for f in sorted(cfg.out.glob("rows-*.parquet")) + sorted(
+        cfg.out.glob("tokens-*.parquet")
+    ):
+        if f.name not in known:
+            log.warning("--resume: removing partial file %s", f.name)
+            f.unlink()
+    log.info(
+        "--resume: %d segments complete, continuing at seq %d / token %d",
+        len(segments),
+        state.seq_cursor,
+        state.token_cursor,
+    )
+    return state
+
+
+#
+
+
+def _write_meta(cfg: DumpConfig, meta: dict[str, Any]) -> None:
+    tmp = cfg.out / (schema.META_FILENAME + ".tmp")
+    with tmp.open("w") as fh:
+        json.dump(meta, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, cfg.out / schema.META_FILENAME)
+
+
