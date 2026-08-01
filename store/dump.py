@@ -415,3 +415,351 @@ def _write_meta(cfg: DumpConfig, meta: dict[str, Any]) -> None:
     os.replace(tmp, cfg.out / schema.META_FILENAME)
 
 
+def dump(
+    cfg: DumpConfig,
+    modules: SAEModules | None = None,
+    model: ResidualModel | None = None,
+    after_flush: Callable[[Segment], None] | None = None,
+) -> dict[str, Any]:
+    """Run the dump; returns the final meta dict."""
+    device = _resolve_device(cfg.device)
+    log.info("device: %s", device)
+
+    if modules is None:
+        modules = load_sae_modules(cfg.sae_repo)
+
+    cfg.checkpoint = Path(cfg.checkpoint).expanduser().resolve()
+    cfg.shard = Path(cfg.shard).expanduser().resolve()
+    cfg.out = Path(cfg.out)
+    cfg.out.mkdir(parents=True, exist_ok=True)
+
+    ckpt_sha = sha256_file(cfg.checkpoint)
+    loaded = load_sae_from_checkpoint(modules, cfg.checkpoint, device=device)
+    sae = loaded.sae
+    log.info(
+        "SAE: n_features=%d d_model=%d config=%s",
+        loaded.n_features,
+        loaded.d_model,
+        {k: v for k, v in loaded.config.items() if k != "raw"},
+    )
+
+    shard = open_token_shard(modules, cfg.shard)
+    per_seq = shard.seq_len - 1
+    available = shard.n_stream_tokens
+    n_target = min(cfg.n_tokens, available)
+    if cfg.n_tokens > available:
+        log.warning(
+            "--n-tokens %d exceeds the %d BOS-excluded tokens in the shard; "
+            "encoding %d",
+            cfg.n_tokens,
+            available,
+            available,
+        )
+
+    layer = cfg.layer if cfg.layer is not None else (
+        loaded.layer if loaded.layer is not None else DEFAULT_LAYER
+    )
+    hook_name = cfg.hook_name or f"blocks.{layer}.hook_resid_post"
+
+    if model is None:
+        model = _load_real_model(cfg.model_name, device)
+    model_d = getattr(getattr(model, "cfg", None), "d_model", None)
+    if model_d is not None and int(model_d) != loaded.d_model:
+        raise SystemExit(
+            f"model d_model={model_d} != SAE d_model={loaded.d_model}: wrong "
+            f"checkpoint/model pair"
+        )
+
+    if cfg.resume:
+        state = _load_resume_state(cfg, ckpt_sha)
+        if state.complete:
+            log.info("--resume: run already complete; nothing to do")
+            with (cfg.out / schema.META_FILENAME).open() as fh:
+                return json.load(fh)
+    else:
+        existing = list(cfg.out.glob("rows-*.parquet"))
+        if existing or (cfg.out / schema.META_FILENAME).is_file():
+            raise SystemExit(
+                f"{cfg.out} already contains dump output; pass --resume to "
+                f"continue it or point --out somewhere clean"
+            )
+        state = _fresh_state()
+
+    writer = SegmentWriter(
+        cfg.out,
+        cfg.rows_per_file,
+        cfg.row_group_size,
+        next_index=len(state.segments),
+        seq_cursor=state.seq_cursor,
+        token_cursor=state.token_cursor,
+    )
+
+    def current_meta(complete: bool) -> dict[str, Any]:
+        tokens_done = state.token_cursor
+        return schema.build_meta(
+            sae_checkpoint={"path": str(cfg.checkpoint), "sha256": ckpt_sha},
+            sae_config=_normalize_sae_config(loaded),
+            hook_name=hook_name,
+            layer=layer,
+            model_name=cfg.model_name,
+            shard={
+                "path": str(cfg.shard),
+                "n_seqs": shard.n_seqs,
+                "seq_len": shard.seq_len,
+                "source": shard.source,
+                "sidecar": shard.sidecar,
+            },
+            n_tokens_requested=cfg.n_tokens,
+            n_tokens_encoded=tokens_done,
+            n_rows=state.n_rows,
+            l0_sum=state.l0_sum,
+            mean_l0=(state.n_rows / tokens_done) if tokens_done else None,
+            rows_per_file=cfg.rows_per_file,
+            row_group_size=cfg.row_group_size,
+            segments=[s.to_dict() for s in state.segments],
+            progress={
+                "seqs_done": state.seq_cursor,
+                "tokens_done": tokens_done,
+                "complete": complete,
+                "run_args": {
+                    "batch_seqs": cfg.batch_seqs,
+                    "encode_chunk": cfg.encode_chunk,
+                    "device": str(device),
+                },
+            },
+            git={
+                "feature_store": git_sha(Path(__file__).resolve().parents[1]),
+                "sae_repo": git_sha(modules.repo_path),
+            },
+        )
+
+    t_start = time.monotonic()
+    t_mark = t_start
+    tokens_mark = rows_mark = 0
+    tokens_run = rows_run = 0
+    n_batches = 0
+
+    def _flush_segment(seg: Segment | None) -> None:
+        if seg is None:
+            return
+        state.segments.append(seg)
+        _write_meta(cfg, current_meta(complete=False))
+        if after_flush is not None:
+            after_flush(seg)
+
+    while state.token_cursor < n_target and state.seq_cursor < shard.n_seqs:
+        seq_lo = state.seq_cursor
+        seq_hi = min(seq_lo + cfg.batch_seqs, shard.n_seqs)
+        batch = np.asarray(shard.tokens[seq_lo:seq_hi])
+        b = batch.shape[0]
+
+        flat = batch_residuals(model, batch, hook_name, layer, device)
+        n_batch_tokens = flat.shape[0]
+        base = state.token_cursor
+        keep = min(n_batch_tokens, n_target - base)
+        flat = flat[:keep]
+
+        rows_parts: list[dict[str, np.ndarray]] = []
+        batch_rows = 0
+        with torch.no_grad():
+            for lo in range(0, keep, cfg.encode_chunk):
+                hi = min(lo + cfg.encode_chunk, keep)
+                h = sae.encode(flat[lo:hi])
+                mask = h > 0
+                state.l0_sum += int(mask.sum().item())
+                r, c = torch.nonzero(mask, as_tuple=True)
+                vals = h[r, c]
+                rows_parts.append(
+                    {
+                        "token_idx": (base + lo + r).cpu().numpy().astype(np.uint32),
+                        "feature": c.cpu().numpy().astype(np.uint32),
+                        "value": vals.cpu().numpy().astype(np.float32),
+                    }
+                )
+                batch_rows += int(r.shape[0])
+
+        rows_batch = {
+            name: np.concatenate([p[name] for p in rows_parts])
+            for name in ("token_idx", "feature", "value")
+        }
+
+        seq_ids = np.repeat(
+            np.arange(seq_lo, seq_hi, dtype=np.int64), per_seq
+        )[:keep]
+        poss = np.tile(np.arange(1, shard.seq_len, dtype=np.int64), b)[:keep]
+        mapped = schema.token_index(seq_ids, poss, shard.seq_len)
+        expected = np.arange(base, base + keep, dtype=np.int64)
+        if not np.array_equal(mapped, expected):
+            raise AssertionError(
+                "token_idx mapping drifted from schema.token_index -- this is "
+                "a bug in store.dump"
+            )
+        tokens_batch = {
+            "token_idx": expected.astype(np.uint32),
+            "seq_idx": seq_ids.astype(np.uint32),
+            "pos": poss.astype(np.uint16),
+            "token_id": batch[:, 1:].reshape(-1)[:keep].astype(np.uint16),
+        }
+
+        state.n_rows += batch_rows
+        state.token_cursor = base + keep
+        state.seq_cursor = seq_hi
+        tokens_run += keep
+        rows_run += batch_rows
+        n_batches += 1
+
+        _flush_segment(
+            writer.add(
+                rows_batch,
+                tokens_batch,
+                seq_end=state.seq_cursor,
+                token_end=state.token_cursor,
+            )
+        )
+
+        if n_batches % cfg.log_every == 0:
+            now = time.monotonic()
+            dt = max(now - t_mark, 1e-9)
+            total_dt = max(now - t_start, 1e-9)
+            log.info(
+                "batch %d | %d/%d tokens | interval %.0f tok/s %.0f rows/s | "
+                "run avg %.0f tok/s %.0f rows/s",
+                n_batches,
+                state.token_cursor,
+                n_target,
+                (tokens_run - tokens_mark) / dt,
+                (rows_run - rows_mark) / dt,
+                tokens_run / total_dt,
+                rows_run / total_dt,
+            )
+            t_mark = now
+            tokens_mark = tokens_run
+            rows_mark = rows_run
+
+    _flush_segment(writer.flush())
+
+    # --- end-of-run invariants ------------------------------------------
+    if state.n_rows != state.l0_sum:
+        raise AssertionError(
+            f"rows written ({state.n_rows}) != sum of per-token L0 on device "
+            f"({state.l0_sum}); dump output is inconsistent"
+        )
+    mean_l0 = state.n_rows / state.token_cursor if state.token_cursor else 0.0
+    ref_l0 = _reference_l0(cfg.checkpoint)
+    if ref_l0 is not None and ref_l0 > 0:
+        rel = abs(mean_l0 - ref_l0) / ref_l0
+        if rel > 0.05:
+            log.warning(
+                "mean L0 %.3f deviates %.1f%% from checkpoint metrics.json "
+                "L0 %.3f",
+                mean_l0,
+                100 * rel,
+                ref_l0,
+            )
+        else:
+            log.info(
+                "mean L0 %.3f within 5%% of metrics.json L0 %.3f",
+                mean_l0,
+                ref_l0,
+            )
+
+    meta = current_meta(complete=True)
+    _write_meta(cfg, meta)
+    total_dt = max(time.monotonic() - t_start, 1e-9)
+    log.info(
+        "done: %d tokens -> %d rows (mean L0 %.3f) in %d files; %.0f tok/s "
+        "%.0f rows/s overall (this run)",
+        state.token_cursor,
+        state.n_rows,
+        mean_l0,
+        len(state.segments),
+        tokens_run / total_dt,
+        rows_run / total_dt,
+    )
+    return meta
+
+
+#
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m store.dump",
+        description="Sequential SAE encode of a token shard to staging "
+        "Parquet (rows-*.parquet + tokens-*.parquet + meta.json).",
+    )
+    p.add_argument("--checkpoint", required=True, type=Path,
+                   help="SAE checkpoint .pt (e.g. ~/sae-gpt2-small/results/"
+                        "frontier/<name>/checkpoint.pt)")
+    p.add_argument("--shard", required=True, type=Path,
+                   help="uint16 token shard .bin with a .json sidecar")
+    p.add_argument("--n-tokens", required=True, type=int,
+                   help="BOS-excluded tokens to encode (capped at shard size)")
+    p.add_argument("--out", required=True, type=Path,
+                   help="output directory, e.g. work/flat/")
+    p.add_argument("--batch-seqs", type=int, default=512,
+                   help="sequences per model forward (default 512)")
+    p.add_argument("--rows-per-file", type=int,
+                   default=schema.DEFAULT_ROWS_PER_FILE,
+                   help="approx rows per Parquet file (default 50M)")
+    p.add_argument("--row-group-size", type=int,
+                   default=schema.DEFAULT_ROW_GROUP_SIZE,
+                   help="Parquet row-group size (default 1M)")
+    p.add_argument("--encode-chunk", type=int, default=16_384,
+                   help="tokens per sae.encode call; caps dense-h memory "
+                        "(default 16384)")
+    p.add_argument("--sae-repo", default=None,
+                   help="path to sae-gpt2-small (default: $SAE_REPO, else "
+                        "~/sae-gpt2-small)")
+    p.add_argument("--resume", action="store_true",
+                   help="continue an interrupted run in --out, skipping "
+                        "segments recorded complete in meta.json")
+    p.add_argument("--device", default="auto",
+                   help="cuda | cpu | auto (default auto)")
+    p.add_argument("--model", dest="model_name", default="gpt2",
+                   help="transformer_lens model name (default gpt2)")
+    p.add_argument("--layer", type=int, default=None,
+                   help="residual layer (default: checkpoint's layer, else 8)")
+    p.add_argument("--hook-name", default=None,
+                   help="override hook (default blocks.<layer>.hook_resid_post)")
+    p.add_argument("--log-every", type=int, default=20,
+                   help="log throughput every N batches (default 20)")
+    return p
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    modules: SAEModules | None = None,
+    model: ResidualModel | None = None,
+    after_flush: Callable[[Segment], None] | None = None,
+) -> int:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        )
+    args = build_parser().parse_args(argv)
+    cfg = DumpConfig(
+        checkpoint=args.checkpoint,
+        shard=args.shard,
+        out=args.out,
+        n_tokens=args.n_tokens,
+        batch_seqs=args.batch_seqs,
+        rows_per_file=args.rows_per_file,
+        row_group_size=args.row_group_size,
+        encode_chunk=args.encode_chunk,
+        sae_repo=args.sae_repo,
+        resume=args.resume,
+        device=args.device,
+        model_name=args.model_name,
+        layer=args.layer,
+        hook_name=args.hook_name,
+        log_every=args.log_every,
+    )
+    dump(cfg, modules=modules, model=model, after_flush=after_flush)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

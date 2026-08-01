@@ -132,6 +132,79 @@ def pipeline(tmp_path_factory) -> SimpleNamespace:
     return env
 
 
+def test_multiple_files_and_segments_recorded(pipeline):
+    rows_files = sorted(p.name for p in pipeline.out.glob("rows-*.parquet"))
+    tokens_files = sorted(p.name for p in pipeline.out.glob("tokens-*.parquet"))
+    assert len(rows_files) >= 3, "test sizing should force several files"
+    assert len(rows_files) == len(tokens_files)
+    segs = pipeline.meta["segments"]
+    assert [s["rows_file"] for s in segs] == rows_files
+    assert [s["tokens_file"] for s in segs] == tokens_files
+    assert segs[-1]["token_end"] == N_STREAM
+
+
+def test_tokens_table_decodes_back_to_shard(pipeline):
+    tok = _read_all(pipeline.out, "tokens-*.parquet")
+    assert np.array_equal(
+        tok["token_idx"], np.arange(N_STREAM, dtype=np.uint32)
+    )
+    mapped = schema.token_index(
+        tok["seq_idx"].astype(np.int64), tok["pos"].astype(np.int64), SEQ_LEN
+    )
+    assert np.array_equal(mapped, tok["token_idx"].astype(np.int64))
+    assert np.array_equal(
+        pipeline.tokens[tok["seq_idx"], tok["pos"]], tok["token_id"]
+    )
+    assert np.all(tok["pos"] >= 1)  # BOS never appears
+
+
+def test_meta_contents(pipeline):
+    meta = pipeline.meta
+    assert meta["format_version"] == schema.FORMAT_VERSION
+    assert meta["n_tokens_requested"] == N_STREAM
+    assert meta["n_tokens_encoded"] == N_STREAM
+    assert meta["hook_name"] == HOOK
+    assert meta["layer"] == LAYER
+    assert meta["compression"] == "zstd"
+    assert meta["rows_per_file"] == ROWS_PER_FILE
+    assert meta["row_group_size"] == schema.DEFAULT_ROW_GROUP_SIZE
+    cfg = meta["sae_config"]
+    assert cfg["n_features"] == N_FEATURES
+    assert cfg["d_model"] == D_MODEL
+    assert cfg["activation"] == "relu"
+    assert cfg["input_scale"] == 1.0
+    ck = meta["sae_checkpoint"]
+    assert ck["path"] == str(pipeline.ckpt.resolve())
+    assert len(ck["sha256"]) == 64
+    assert meta["shard"]["sidecar"]["dataset"] == "fake-holdout"
+    assert meta["shard"]["seq_len"] == SEQ_LEN
+    assert meta["progress"]["complete"] is True
+    assert set(meta["git"]) == {"feature_store", "sae_repo"}
+    assert meta["created_at"]
+
+
+def test_trim_to_requested_n_tokens(tmp_path):
+    env = _setup(tmp_path, tag="trim")
+    out = tmp_path / "flat"
+    n = 100  # not a multiple of PER_SEQ: forces a mid-sequence trim
+    dump_mod.main(argv=_argv(env, out, n), modules=env.mods, model=env.model)
+    meta = _read_meta(out)
+    assert meta["n_tokens_encoded"] == n
+    tok = _read_all(out, "tokens-*.parquet")
+    assert np.array_equal(tok["token_idx"], np.arange(n, dtype=np.uint32))
+    rows = _read_all(out, "rows-*.parquet")
+    assert rows["token_idx"].max() < n
+    assert rows["token_idx"].shape[0] == meta["n_rows"] == meta["l0_sum"]
+
+
+def test_refuses_dirty_out_dir_without_resume(tmp_path):
+    env = _setup(tmp_path, tag="dirty")
+    out = tmp_path / "flat"
+    dump_mod.main(argv=_argv(env, out, 30), modules=env.mods, model=env.model)
+    with pytest.raises(SystemExit):
+        dump_mod.main(argv=_argv(env, out, 30), modules=env.mods, model=env.model)
+
+
 class _Interrupt(RuntimeError):
     pass
 
@@ -160,3 +233,117 @@ def test_reference_l0_reads_top_level_and_nested(tmp_path):
     assert dump_mod._reference_l0(ckpt) is None
 
 
+def test_resume_after_interruption_matches_uninterrupted(tmp_path):
+    env = _setup(tmp_path, tag="resume")
+
+    ref_out = tmp_path / "ref"
+    dump_mod.main(argv=_argv(env, ref_out, N_STREAM), modules=env.mods, model=env.model)
+
+    out = tmp_path / "resumed"
+
+    def boom(seg: dump_mod.Segment) -> None:
+        if seg.index == 0:
+            raise _Interrupt("simulated crash after first segment")
+
+    with pytest.raises(_Interrupt):
+        dump_mod.main(
+            argv=_argv(env, out, N_STREAM),
+            modules=env.mods,
+            model=env.model,
+            after_flush=boom,
+        )
+    # partial state: meta exists, marked incomplete
+    assert _read_meta(out)["progress"]["complete"] is False
+
+    dump_mod.main(
+        argv=_argv(env, out, N_STREAM, "--resume"),
+        modules=env.mods,
+        model=env.model,
+    )
+
+    ref_meta, meta = _read_meta(ref_out), _read_meta(out)
+    assert meta["progress"]["complete"] is True
+    assert meta["n_rows"] == ref_meta["n_rows"]
+    assert meta["l0_sum"] == ref_meta["l0_sum"]
+    for pattern in ("rows-*.parquet", "tokens-*.parquet"):
+        a, b = _read_all(ref_out, pattern), _read_all(out, pattern)
+        for col in a:
+            assert np.array_equal(a[col], b[col]), (pattern, col)
+
+
+def test_resume_on_complete_run_is_noop(tmp_path):
+    env = _setup(tmp_path, tag="noop")
+    out = tmp_path / "flat"
+    dump_mod.main(argv=_argv(env, out, 60), modules=env.mods, model=env.model)
+    before = _read_meta(out)
+    dump_mod.main(
+        argv=_argv(env, out, 60, "--resume"), modules=env.mods, model=env.model
+    )
+    assert _read_meta(out) == before
+
+
+def test_cli_runs_as_module():
+    root = Path(store.__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, "-m", "store.dump", "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--sae-repo" in proc.stdout
+
+
+def test_real_gpt2_end_to_end(tmp_path, gpt2_model):
+    """The brief's canonical test: fake SAE (random weights, 64 features) + real
+    GPT-2 on a 32-sequence shard. Skips if GPT-2 cannot be loaded."""
+    repo = make_fake_repo(tmp_path / "repo", tag="gpt2")
+    mods = load_sae_modules(str(repo))
+    cfg_cls = sys.modules["sparse_autoencoder"].SAEConfig
+    d_model = int(gpt2_model.cfg.d_model)
+    ckpt = make_checkpoint(
+        tmp_path / "checkpoint.pt", mods.SparseAutoencoder, cfg_cls,
+        d_model=d_model, n_features=N_FEATURES, seed=5, layer=8,
+    )
+    shard = make_shard(tmp_path / "holdout.bin", n_seqs=32, seq_len=SEQ_LEN, seed=3)
+    out = tmp_path / "flat"
+    n_target = 32 * PER_SEQ
+    dump_mod.main(
+        argv=[
+            "--checkpoint", str(ckpt), "--shard", str(shard),
+            "--n-tokens", str(n_target), "--out", str(out),
+            "--batch-seqs", "8", "--rows-per-file", str(ROWS_PER_FILE),
+            "--encode-chunk", str(ENCODE_CHUNK), "--sae-repo", str(repo),
+            "--device", "cpu",
+        ],
+        modules=mods,
+        model=gpt2_model,
+    )
+    meta = _read_meta(out)
+    assert meta["layer"] == 8  # taken from the checkpoint
+    assert meta["hook_name"] == "blocks.8.hook_resid_post"
+    assert meta["n_rows"] == meta["l0_sum"] > 0
+
+    rows = _read_all(out, "rows-*.parquet")
+    assert rows["token_idx"].shape[0] == meta["n_rows"]
+
+    # Recompute the first batch with identical shapes and compare its rows.
+    sae = load_sae_from_checkpoint(mods, ckpt).sae
+    tokens = np.fromfile(shard, dtype=np.uint16).reshape(32, SEQ_LEN)
+    flat = dump_mod.batch_residuals(
+        gpt2_model, tokens[:8], "blocks.8.hook_resid_post", 8,
+        torch.device("cpu"),
+    )
+    with torch.no_grad():
+        first_chunk = sae.encode(flat[:ENCODE_CHUNK])
+    r, c = torch.nonzero(first_chunk > 0, as_tuple=True)
+    n = r.shape[0]
+    assert np.array_equal(rows["token_idx"][:n], r.numpy().astype(np.uint32))
+    assert np.array_equal(rows["feature"][:n], c.numpy().astype(np.uint32))
+    assert np.allclose(
+        rows["value"][:n], first_chunk[r, c].numpy(), rtol=0, atol=1e-6
+    )
+
+    tok = _read_all(out, "tokens-*.parquet")
+    assert np.array_equal(tokens[tok["seq_idx"], tok["pos"]], tok["token_id"])
