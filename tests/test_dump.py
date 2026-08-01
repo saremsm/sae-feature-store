@@ -132,6 +132,18 @@ def pipeline(tmp_path_factory) -> SimpleNamespace:
     return env
 
 
+def test_rows_written_and_count_matches_l0(pipeline):
+    rows = _read_all(pipeline.out, "rows-*.parquet")
+    n_rows = rows["token_idx"].shape[0]
+    assert n_rows > 0
+    # exact equality: files == meta n_rows == device-accumulated L0 sum
+    assert n_rows == pipeline.meta["n_rows"] == pipeline.meta["l0_sum"]
+    # ... and matches an independent recount of positives over the shard.
+    expected = _expected_rows(pipeline, N_STREAM)
+    assert n_rows == expected["token_idx"].shape[0]
+    assert pipeline.meta["mean_l0"] == pytest.approx(n_rows / N_STREAM)
+
+
 def test_multiple_files_and_segments_recorded(pipeline):
     rows_files = sorted(p.name for p in pipeline.out.glob("rows-*.parquet"))
     tokens_files = sorted(p.name for p in pipeline.out.glob("tokens-*.parquet"))
@@ -141,6 +153,35 @@ def test_multiple_files_and_segments_recorded(pipeline):
     assert [s["rows_file"] for s in segs] == rows_files
     assert [s["tokens_file"] for s in segs] == tokens_files
     assert segs[-1]["token_end"] == N_STREAM
+
+
+def test_token_idx_monotone_within_and_across_files(pipeline):
+    files = sorted(pipeline.out.glob("rows-*.parquet"))
+    prev_last: int | None = None
+    for f in files:
+        idx = pq.read_table(f, columns=["token_idx"]).column("token_idx").to_numpy()
+        if idx.size == 0:
+            continue
+        assert np.all(np.diff(idx.astype(np.int64)) >= 0), f"{f.name} not sorted"
+        if prev_last is not None:
+            assert idx[0] > prev_last, f"{f.name} overlaps previous file"
+        prev_last = int(idx[-1])
+
+
+def test_rows_equal_recomputed_stream(pipeline):
+    """Every written row (token_idx, feature, value) equals sae.encode(x) recomputed
+    with identical batching -- including a spot check via the schema mapping."""
+    rows = _read_all(pipeline.out, "rows-*.parquet")
+    expected = _expected_rows(pipeline, N_STREAM)
+    assert np.array_equal(rows["token_idx"], expected["token_idx"])
+    assert np.array_equal(rows["feature"], expected["feature"])
+    assert np.array_equal(rows["value"], expected["value"])
+
+    rng = np.random.default_rng(0)
+    for i in rng.integers(0, rows["token_idx"].shape[0], size=25):
+        t = int(rows["token_idx"][i])
+        seq_idx, pos = schema.token_to_seq_pos(t, SEQ_LEN)
+        assert schema.token_index(seq_idx, pos, SEQ_LEN) == t
 
 
 def test_tokens_table_decodes_back_to_shard(pipeline):
@@ -156,6 +197,13 @@ def test_tokens_table_decodes_back_to_shard(pipeline):
         pipeline.tokens[tok["seq_idx"], tok["pos"]], tok["token_id"]
     )
     assert np.all(tok["pos"] >= 1)  # BOS never appears
+
+
+def test_written_schemas_match_schema_py(pipeline):
+    for f in pipeline.out.glob("rows-*.parquet"):
+        assert pq.read_schema(f).equals(schema.ROWS_SCHEMA), f.name
+    for f in pipeline.out.glob("tokens-*.parquet"):
+        assert pq.read_schema(f).equals(schema.TOKENS_SCHEMA), f.name
 
 
 def test_meta_contents(pipeline):
