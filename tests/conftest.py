@@ -197,6 +197,103 @@ class FakeModel:
         return None, {names_filter: resid}
 
 
+def make_flat(
+    out: Path,
+    *,
+    n_features: int,
+    n_tokens: int,
+    n_files: int = 3,
+    mean_l0: int = 4,
+    seed: int = 0,
+    row_group_size: int = 64,
+) -> dict:
+    """Write a tiny fake-dump flat set: rows-NNNNN.parquet files in
+    ``store.schema.ROWS_SCHEMA`` plus a meta.json shaped like the real one (via
+    ``schema.build_meta``), for partition-stage tests."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from store import schema
+
+    out.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    per_file = -(-n_tokens // n_files)  # ceil
+    segments = []
+    n_rows = 0
+    for i in range(n_files):
+        t0, t1 = i * per_file, min((i + 1) * per_file, n_tokens)
+        if t0 >= t1:
+            break
+        toks, feats, vals = [], [], []
+        for t in range(t0, t1):
+            f = rng.choice(n_features, size=mean_l0, replace=False)
+            f.sort()
+            toks.append(np.full(mean_l0, t, dtype=np.uint32))
+            feats.append(f.astype(np.uint32))
+            vals.append(
+                (rng.random(mean_l0) + 0.01).astype(np.float32)
+            )
+        table = pa.table(
+            {
+                "token_idx": np.concatenate(toks),
+                "feature": np.concatenate(feats),
+                "value": np.concatenate(vals),
+            },
+            schema=schema.ROWS_SCHEMA,
+        )
+        name = schema.ROWS_FILE_FMT.format(index=i)
+        pq.write_table(
+            table,
+            out / name,
+            row_group_size=row_group_size,
+            compression=schema.COMPRESSION,
+        )
+        segments.append(
+            {
+                "index": i,
+                "rows_file": name,
+                "tokens_file": schema.TOKENS_FILE_FMT.format(index=i),
+                "seq_start": 0,
+                "seq_end": 0,
+                "token_start": t0,
+                "token_end": t1,
+                "n_rows": int(table.num_rows),
+            }
+        )
+        n_rows += int(table.num_rows)
+
+    meta = schema.build_meta(
+        sae_checkpoint={"path": "fake/checkpoint.pt", "sha256": "0" * 64},
+        sae_config={
+            "activation": "topk",
+            "k": mean_l0,
+            "l1_coeff": 0.0,
+            "expansion": 1.0,
+            "n_features": n_features,
+            "d_model": 16,
+            "input_scale": 1.0,
+            "raw": {},
+        },
+        hook_name="blocks.0.hook_resid_post",
+        layer=0,
+        model_name="fake",
+        shard={"path": "fake/holdout.bin", "n_seqs": 1, "seq_len": 2,
+               "sidecar": {}},
+        n_tokens_requested=n_tokens,
+        n_tokens_encoded=n_tokens,
+        n_rows=n_rows,
+        l0_sum=n_rows,
+        mean_l0=float(mean_l0),
+        rows_per_file=per_file * mean_l0,
+        row_group_size=row_group_size,
+        segments=segments,
+        progress={"seqs_done": 0, "tokens_done": n_tokens, "complete": True},
+        git={"feature_store": None, "sae_repo": None},
+    )
+    (out / schema.META_FILENAME).write_text(json.dumps(meta, indent=1))
+    return meta
+
+
 @pytest.fixture(scope="session")
 def gpt2_model():
     """Real GPT-2 via transformer_lens, or skip if it cannot be loaded (e.g. no
