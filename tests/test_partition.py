@@ -20,6 +20,7 @@ from store.partition import (
     PartitionConfig,
     bucket_bounds,
     bucket_expr_sql,
+    check_dataset,
     write_partitions,
 )
 

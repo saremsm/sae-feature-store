@@ -382,3 +382,320 @@ def _forward_meta(
 #
 
 
+@dataclass
+class BucketStat:
+    bucket: int
+    lo: int
+    hi: int
+    rows: int
+    bytes: int
+    n_keys: int
+    min_rows_per_key: int
+    max_rows_per_key: int
+    n_files: int
+    n_row_groups: int
+
+
+@dataclass
+class CheckReport:
+    ok: bool = True
+    errors: list[str] = field(default_factory=list)
+    layout: str = ""
+    key: str = ""
+    n_buckets: int = 0
+    domain: int = 0
+    total_rows: int = 0
+    total_bytes: int = 0
+    n_keys: int = 0
+    n_files: int = 0
+    n_row_groups: int = 0
+    mean_row_groups_touched_per_key: float = 0.0
+    boundary_shared_row_groups: int = 0
+    buckets: list[BucketStat] = field(default_factory=list)
+
+    def error(self, msg: str) -> None:
+        self.ok = False
+        self.errors.append(msg)
+        log.error("check: %s", msg)
+
+
+def check_dataset(
+    out: Path,
+    *,
+    threads: int = DEFAULT_THREADS,
+    memory_limit: str = DEFAULT_MEMORY_LIMIT,
+    write_stats: bool = False,
+) -> CheckReport:
+    """Run every post-check against a bucketed dataset; optionally (re)write
+    stats.json. Never raises on a failed invariant - failures land in
+    ``report.errors`` (the CLI exits non-zero on any)."""
+    rep = CheckReport()
+    out = Path(out)
+    map_path = out / BUCKET_MAP_FILENAME
+    meta_path = out / schema.META_FILENAME
+    if not map_path.exists() or not meta_path.exists():
+        rep.error(
+            f"{out} is not a bucketed dataset (missing "
+            f"{BUCKET_MAP_FILENAME} or {schema.META_FILENAME})"
+        )
+        return rep
+
+    bmap = json.loads(map_path.read_text())
+    meta = json.loads(meta_path.read_text())
+    layout = LAYOUTS[bmap["layout"]]
+    n_buckets = int(bmap["n_buckets"])
+    domain = int(bmap["domain"])
+    rep.layout, rep.key = layout.name, layout.key
+    rep.n_buckets, rep.domain = n_buckets, domain
+
+    # Guard against a hand-edited bucket_map.json drifting from the formula.
+    expect = bucket_bounds(n_buckets, domain)
+    got = [(int(b["lo"]), int(b["hi"])) for b in bmap["buckets"]]
+    if got != expect:
+        rep.error("bucket_map.json ranges do not match the bucket formula")
+        return rep
+    if bmap.get("bucket_expr") != bucket_expr_sql(layout.key, n_buckets, domain):
+        rep.error("bucket_map.json bucket_expr does not match the formula")
+        return rep
+
+    files = sorted(out.glob(PARTITION_GLOB))
+    if not files:
+        rep.error(f"no partition files under {out / PARTITION_GLOB}")
+        return rep
+    rep.n_files = len(files)
+
+    expected_rows = int(
+        meta.get("partition", {}).get("source_rows", meta.get("n_rows", -1))
+    )
+    expr = bucket_expr_sql(layout.key, n_buckets, domain)
+
+    con = duckdb.connect()
+    con.execute(f"SET threads = {int(threads)}")
+    con.execute(f"SET memory_limit = '{memory_limit}'")
+    try:
+        rel = _bucketed_glob_sql(out)
+
+        (total, max_key) = con.execute(
+            f"SELECT count(*), max({layout.key}) FROM {rel}"
+        ).fetchone()
+        rep.total_rows = int(total)
+        if rep.total_rows != expected_rows:
+            rep.error(
+                f"total rows changed: bucketed has {rep.total_rows}, "
+                f"source had {expected_rows}"
+            )
+        if max_key is not None and int(max_key) >= domain:
+            rep.error(
+                f"max {layout.key} {int(max_key)} >= domain {domain}"
+            )
+
+        (mismatch,) = con.execute(
+            f"SELECT count(*) FROM {rel} "
+            f"WHERE CAST(bucket AS BIGINT) <> {expr}"
+        ).fetchone()
+        if int(mismatch):
+            rep.error(
+                f"{int(mismatch)} rows live in a partition that does not "
+                f"match the bucket expression"
+            )
+
+        (multi,) = con.execute(
+            f"SELECT count(*) FROM ("
+            f"SELECT {layout.key} FROM {rel} GROUP BY 1 "
+            f"HAVING count(DISTINCT bucket) > 1)"
+        ).fetchone()
+        if int(multi):
+            rep.error(
+                f"{int(multi)} {layout.key_label}s have rows in more than "
+                f"one bucket"
+            )
+
+        per_key = con.execute(
+            f"SELECT CAST(bucket AS BIGINT) AS b, "
+            f"CAST({layout.key} AS BIGINT) AS k, count(*) AS c "
+            f"FROM {rel} GROUP BY 1, 2 ORDER BY 1, 2"
+        ).fetchnumpy()
+        kb = per_key["b"].astype(np.int64)
+        kk = per_key["k"].astype(np.int64)
+        kc = per_key["c"].astype(np.int64)
+        rep.n_keys = int(kk.size)
+    finally:
+        con.close()
+
+    # -- per-file scan: sort order + row-group statistics -------------------
+    per_bucket_files: dict[int, list[Path]] = {}
+    for f in files:
+        b = int(f.parent.name.split("=", 1)[1])
+        per_bucket_files.setdefault(b, []).append(f)
+
+    key_col = layout.key
+    sec_col = layout.secondary
+    intervals: dict[int, list[tuple[int, int]]] = {}
+    total_bytes = 0
+    n_row_groups = 0
+    boundary_shared = 0
+    files_stats: dict[int, tuple[int, int]] = {}  # bucket -> (n_files, n_rg)
+
+    for b, bfiles in sorted(per_bucket_files.items()):
+        if not 0 <= b < n_buckets:
+            rep.error(f"partition dir bucket={b} outside [0, {n_buckets})")
+            continue
+        lo, hi = expect[b]
+        ivals: list[tuple[int, int]] = []
+        n_rg_b = 0
+        for f in bfiles:
+            total_bytes += f.stat().st_size
+            pf = pq.ParquetFile(f)
+            names = pf.schema_arrow.names
+            if "bucket" in names:
+                rep.error(f"{f}: partition column 'bucket' stored in file")
+            if key_col not in names or sec_col not in names:
+                rep.error(
+                    f"{f}: missing column(s) {key_col}/{sec_col}; "
+                    f"schema is {names}"
+                )
+                continue
+            key_i = names.index(key_col)
+            md = pf.metadata
+            n_rg_b += md.num_row_groups
+            prev_max: int | None = None
+            prev_last: int | None = None
+            for g in range(md.num_row_groups):
+                st = md.row_group(g).column(key_i).statistics
+                if st is None or not st.has_min_max:
+                    rep.error(f"{f} row group {g}: no min/max statistics")
+                    continue
+                gmin, gmax = int(st.min), int(st.max)
+                ivals.append((gmin, gmax))
+                if prev_max is not None:
+                    if gmin < prev_max:
+                        rep.error(
+                            f"{f}: row groups {g - 1} and {g} overlap on "
+                            f"{key_col} ({prev_max} > {gmin})"
+                        )
+                    elif gmin == prev_max:
+                        boundary_shared += 1
+                prev_max = gmax
+                # data-level sort check on (key, secondary)
+                tb = pf.read_row_group(g, columns=[key_col, sec_col])
+                k = tb[key_col].to_numpy().astype(np.uint64)
+                s = tb[sec_col].to_numpy().astype(np.uint64)
+                packed = (k << np.uint64(32)) | s
+                if packed.size and not bool(np.all(packed[1:] >= packed[:-1])):
+                    rep.error(
+                        f"{f} row group {g}: not sorted by "
+                        f"({key_col}, {sec_col})"
+                    )
+                if packed.size:
+                    if prev_last is not None and int(packed[0]) < prev_last:
+                        rep.error(
+                            f"{f}: rows not sorted across row groups "
+                            f"{g - 1} -> {g}"
+                        )
+                    prev_last = int(packed[-1])
+                if k.size and (int(k.min()) < lo or int(k.max()) >= hi):
+                    rep.error(
+                        f"{f} row group {g}: {key_col} outside bucket {b} "
+                        f"range [{lo}, {hi})"
+                    )
+        intervals[b] = ivals
+        n_row_groups += n_rg_b
+        files_stats[b] = (len(bfiles), n_rg_b)
+
+    rep.total_bytes = total_bytes
+    rep.n_row_groups = n_row_groups
+    rep.boundary_shared_row_groups = boundary_shared
+
+    # -- per-bucket stats + mean row-groups-touched-per-key -----------------
+    touched_total = 0
+    for b in range(n_buckets):
+        lo, hi = expect[b]
+        sel = kb == b
+        keys_b = kk[sel]
+        counts_b = kc[sel]
+        if keys_b.size and (
+            int(keys_b.min()) < lo or int(keys_b.max()) >= hi
+        ):
+            rep.error(
+                f"bucket {b}: contains {layout.key_label}s outside "
+                f"[{lo}, {hi})"
+            )
+        nf, nrg = files_stats.get(b, (0, 0))
+        bts = sum(
+            f.stat().st_size for f in per_bucket_files.get(b, [])
+        )
+        rep.buckets.append(
+            BucketStat(
+                bucket=b, lo=lo, hi=hi,
+                rows=int(counts_b.sum()) if counts_b.size else 0,
+                bytes=bts,
+                n_keys=int(keys_b.size),
+                min_rows_per_key=int(counts_b.min()) if counts_b.size else 0,
+                max_rows_per_key=int(counts_b.max()) if counts_b.size else 0,
+                n_files=nf,
+                n_row_groups=nrg,
+            )
+        )
+        for gmin, gmax in intervals.get(b, []):
+            touched_total += int(
+                np.searchsorted(keys_b, gmax, side="right")
+                - np.searchsorted(keys_b, gmin, side="left")
+            )
+    if rep.n_keys:
+        rep.mean_row_groups_touched_per_key = touched_total / rep.n_keys
+
+    sum_bucket_rows = sum(s.rows for s in rep.buckets)
+    if sum_bucket_rows != rep.total_rows:
+        rep.error(
+            f"per-bucket rows sum to {sum_bucket_rows}, "
+            f"total is {rep.total_rows}"
+        )
+
+    if write_stats:
+        _write_stats(out, layout, rep)
+    else:
+        _cross_check_stats(out, layout, rep)
+
+    log.info(
+        "check %s: %s | layout=%s rows=%d bytes=%d %ss=%d files=%d "
+        "row_groups=%d mean_row_groups_touched_per_%s=%.3f "
+        "boundary_shared=%d",
+        out, "OK" if rep.ok else f"FAILED ({len(rep.errors)} errors)",
+        rep.layout, rep.total_rows, rep.total_bytes, layout.key_label,
+        rep.n_keys, rep.n_files, rep.n_row_groups, layout.key_label,
+        rep.mean_row_groups_touched_per_key, rep.boundary_shared_row_groups,
+    )
+    return rep
+
+
+def _stats_payload(layout: Layout, rep: CheckReport) -> dict[str, Any]:
+    kl = layout.key_label
+    return {
+        "format_version": schema.FORMAT_VERSION,
+        "layout": rep.layout,
+        "key": rep.key,
+        "n_buckets": rep.n_buckets,
+        "domain": rep.domain,
+        "total_rows": rep.total_rows,
+        "total_bytes": rep.total_bytes,
+        f"n_{kl}s": rep.n_keys,
+        "n_files": rep.n_files,
+        "n_row_groups": rep.n_row_groups,
+        f"mean_row_groups_touched_per_{kl}": (
+            rep.mean_row_groups_touched_per_key
+        ),
+        "boundary_shared_row_groups": rep.boundary_shared_row_groups,
+        "buckets": [
+            {
+                "bucket": s.bucket, "lo": s.lo, "hi": s.hi,
+                "rows": s.rows, "bytes": s.bytes,
+                f"{kl}s": s.n_keys,
+                f"min_rows_per_{kl}": s.min_rows_per_key,
+                f"max_rows_per_{kl}": s.max_rows_per_key,
+                "files": s.n_files, "row_groups": s.n_row_groups,
+            }
+            for s in rep.buckets
+        ],
+    }
+
+
