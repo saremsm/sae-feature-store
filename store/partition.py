@@ -699,3 +699,104 @@ def _stats_payload(layout: Layout, rep: CheckReport) -> dict[str, Any]:
     }
 
 
+def _write_stats(out: Path, layout: Layout, rep: CheckReport) -> None:
+    (out / STATS_FILENAME).write_text(
+        json.dumps(_stats_payload(layout, rep), indent=1)
+    )
+    log.info("wrote %s", out / STATS_FILENAME)
+
+
+def _cross_check_stats(out: Path, layout: Layout, rep: CheckReport) -> None:
+    """--check mode: if stats.json exists, its totals must still be true."""
+    p = out / STATS_FILENAME
+    if not p.exists():
+        rep.error(f"missing {p} (partition run did not complete its checks)")
+        return
+    stats = json.loads(p.read_text())
+    fresh = _stats_payload(layout, rep)
+    for k in ("total_rows", f"n_{layout.key_label}s", "n_buckets", "domain"):
+        if stats.get(k) != fresh.get(k):
+            rep.error(
+                f"stats.json {k}={stats.get(k)} but dataset has "
+                f"{fresh.get(k)}"
+            )
+
+
+#
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m store.partition",
+        description=(
+            "Partition flat (token_idx, feature, value) rows into "
+            "feature-bucketed (or token-bucketed) Parquet, or --check an "
+            "existing bucketed dataset."
+        ),
+    )
+    p.add_argument("--check", type=Path, metavar="DIR", default=None,
+                   help="verify an existing bucketed dataset and exit")
+    p.add_argument("--flat", type=Path, default=None,
+                   help="input dir written by store.dump (contains "
+                        "rows-*.parquet + meta.json)")
+    p.add_argument("--out", type=Path, default=None,
+                   help="output dir, e.g. work/bucketed/ "
+                        "(work/bucketed_by_token/ for --layout token)")
+    p.add_argument("--layout", choices=sorted(LAYOUTS), default="feature",
+                   help="bucket by feature range (default) or token_idx "
+                        "range")
+    p.add_argument("--n-buckets", type=int, default=DEFAULT_N_BUCKETS)
+    p.add_argument("--row-group-size", type=int,
+                   default=schema.DEFAULT_ROW_GROUP_SIZE)
+    p.add_argument("--threads", type=int, default=DEFAULT_THREADS)
+    p.add_argument("--memory-limit", default=DEFAULT_MEMORY_LIMIT)
+    p.add_argument("--temp-dir", type=Path, default=None,
+                   help="DuckDB spill dir (default: <out>/_duckdb_tmp, "
+                        "i.e. under work/)")
+    p.add_argument("--per-bucket-passes", action="store_true",
+                   help="one filtered pass per bucket instead of a single "
+                        "global ORDER BY; use when the global sort would "
+                        "exceed --memory-limit (the ~5B-row case)")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    if args.check is not None:
+        rep = check_dataset(
+            args.check, threads=args.threads,
+            memory_limit=args.memory_limit,
+        )
+        if not rep.ok:
+            log.error("--check failed with %d error(s)", len(rep.errors))
+            return 1
+        return 0
+
+    if args.flat is None or args.out is None:
+        parser.error("--flat and --out are required (or use --check)")
+    cfg = PartitionConfig(
+        flat=args.flat, out=args.out, layout=args.layout,
+        n_buckets=args.n_buckets, row_group_size=args.row_group_size,
+        threads=args.threads, memory_limit=args.memory_limit,
+        temp_dir=args.temp_dir, per_bucket_passes=args.per_bucket_passes,
+    )
+    write_partitions(cfg)
+    rep = check_dataset(
+        cfg.out, threads=cfg.threads, memory_limit=cfg.memory_limit,
+        write_stats=True,
+    )
+    if not rep.ok:
+        log.error("post-checks failed with %d error(s)", len(rep.errors))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
