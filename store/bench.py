@@ -37,6 +37,52 @@ DEFAULT_KILL_THRESHOLD = 5.0
 #
 
 
+def _drop_caches_global() -> bool:
+    """``sync`` + ``echo 3 > /proc/sys/vm/drop_caches``. Root only."""
+    try:
+        if hasattr(os, "sync"):
+            os.sync()
+        with open("/proc/sys/vm/drop_caches", "w") as fh:
+            fh.write("3\n")
+        return True
+    except OSError:
+        return False
+
+
+def _fadvise_dontneed(files: list[Path]) -> bool:
+    """Best-effort page-cache eviction of ``files`` via POSIX_FADV_DONTNEED (works
+    without root; dirty pages are synced first so they can drop)."""
+    if not hasattr(os, "posix_fadvise"):
+        return False
+    if hasattr(os, "sync"):
+        os.sync()
+    for f in files:
+        fd = os.open(f, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    return True
+
+
+def drop_caches(files: list[Path], method: str = "auto") -> str:
+    """Evict ``files`` (ideally everything) from the page cache."""
+    if method == "none":
+        return "none"
+    if method in ("auto", "drop_caches") and _drop_caches_global():
+        return "drop_caches"
+    if method == "drop_caches":
+        raise PermissionError(
+            "--cache-drop drop_caches requires root "
+            "(sudo -E python -m store.bench ...)"
+        )
+    if method in ("auto", "fadvise") and _fadvise_dontneed(files):
+        return "fadvise"
+    if method == "fadvise":
+        raise OSError("os.posix_fadvise is unavailable on this platform")
+    return "none"
+
+
 def store_files(store: Path) -> list[Path]:
     """Every parquet file the benchmark can possibly touch."""
     out: list[Path] = []

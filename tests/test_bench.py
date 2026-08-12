@@ -43,6 +43,54 @@ def test_sample_tokens_uniform_and_seeded(store: Path):
     assert toks == bench.sample_tokens(meta, 5, seed=3)
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "posix_fadvise"),
+    reason="posix_fadvise unavailable on this platform",
+)
+def test_fadvise_fallback_path_executes(store: Path):
+    files = bench.store_files(store)
+    assert files
+    assert bench.drop_caches(files, method="fadvise") == "fadvise"
+
+
+def test_drop_caches_auto_without_root(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # force the root-only global drop to fail.
+    monkeypatch.setattr(bench, "_drop_caches_global", lambda: False)
+    method = bench.drop_caches(bench.store_files(store), method="auto")
+    expected = "fadvise" if hasattr(os, "posix_fadvise") else "none"
+    assert method == expected
+
+
+def test_drop_caches_none_is_noop(store: Path):
+    assert bench.drop_caches([], method="none") == "none"
+
+
+def test_drop_caches_pinned_method_errors_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(bench, "_drop_caches_global", lambda: False)
+    with pytest.raises(PermissionError, match="requires root"):
+        bench.drop_caches([], method="drop_caches")
+
+
+def test_aggregate_percentiles():
+    samples = [
+        bench.Sample(
+            key=0, trial=i, elapsed_s=float(i + 1), rows=10,
+            bytes_read=100, files_touched=1, row_groups_touched=None,
+        )
+        for i in range(4)
+    ]
+    agg = bench.aggregate(samples)
+    assert agg["n_samples"] == 4
+    assert agg["p50_s"] == pytest.approx(np.percentile([1, 2, 3, 4], 50))
+    assert agg["mean_s"] == pytest.approx(2.5)
+    assert agg["bytes_read_mean"] == pytest.approx(100.0)
+    assert agg["row_groups_touched_mean"] is None
+
+
 def test_method_matrix_requires_feature_layout(tmp_path: Path):
     with pytest.raises(FileNotFoundError, match="store.partition"):
         bench.method_matrix(tmp_path)
