@@ -33,6 +33,40 @@ def _run(store: Path, out: Path, *extra: str) -> int:
     )
 
 
+def test_sampling_is_stratified_by_tercile(store: Path):
+    picked = bench.sample_features(
+        store / queries.BUCKETED_SUBDIR, 6, seed=1
+    )
+    assert len(picked) == 6
+    terciles = [p["tercile"] for p in picked]
+    assert set(terciles) == set(bench.TERCILES)
+    assert all(t in bench.TERCILES for t in terciles)
+    # bottom-tercile picks really are rarer than top-tercile picks
+    bot = min(p["rows"] for p in picked if p["tercile"] == "bottom")
+    top = max(p["rows"] for p in picked if p["tercile"] == "top")
+    assert bot <= top
+    # deterministic under the seed
+    assert picked == bench.sample_features(
+        store / queries.BUCKETED_SUBDIR, 6, seed=1
+    )
+
+
+def test_sampling_cross_checks_stats(store: Path, tmp_path: Path):
+    # a stale stats.json must be caught, not silently used
+    src = store / queries.BUCKETED_SUBDIR
+    stats = json.loads((src / "stats.json").read_text())
+    stats["total_rows"] += 1
+    bad = tmp_path / "bucketed_bad"
+    bad.mkdir()
+    for f in src.glob("bucket=*/*.parquet"):
+        dst = bad / f.parent.name
+        dst.mkdir(exist_ok=True)
+        dst.joinpath(f.name).write_bytes(f.read_bytes())
+    (bad / "stats.json").write_text(json.dumps(stats))
+    with pytest.raises(AssertionError, match="stale stats.json"):
+        bench.sample_features(bad, 3, seed=0)
+
+
 def test_sample_tokens_uniform_and_seeded(store: Path):
     meta = json.loads(
         (store / queries.BUCKETED_SUBDIR / "meta.json").read_text()

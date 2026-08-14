@@ -112,6 +112,46 @@ def feature_counts(bucketed: Path) -> tuple[np.ndarray, np.ndarray]:
     return res["f"].astype(np.int64), res["c"].astype(np.int64)
 
 
+def sample_features(
+    bucketed: Path, n: int, seed: int
+) -> list[dict[str, Any]]:
+    """Stratified feature sample: split features by rows-per-feature into terciles
+    and draw ~n/3 from each (uniform within tercile, without replacement)."""
+    feats, counts = feature_counts(bucketed)
+    stats_path = bucketed / STATS_FILENAME
+    if stats_path.exists():
+        stats = json.loads(stats_path.read_text())
+        if int(stats["total_rows"]) != int(counts.sum()) or int(
+            stats["n_features"]
+        ) != int(feats.size):
+            raise AssertionError(
+                f"measured per-feature counts (rows={int(counts.sum())}, "
+                f"features={int(feats.size)}) disagree with {stats_path} "
+                f"(rows={stats['total_rows']}, "
+                f"features={stats['n_features']}) - stale stats.json?"
+            )
+    else:
+        log.warning("no %s; skipping totals cross-check", stats_path)
+
+    order = np.argsort(counts, kind="stable")
+    thirds = np.array_split(order, 3)  # bottom, middle, top by frequency
+    rng = np.random.default_rng(seed)
+    per = [n // 3 + (1 if i < n % 3 else 0) for i in range(3)]
+    picked: list[dict[str, Any]] = []
+    for tercile, idxs, want in zip(TERCILES, thirds, per):
+        take = min(want, idxs.size)
+        sel = rng.choice(idxs, size=take, replace=False)
+        for i in sorted(int(s) for s in sel):
+            picked.append(
+                {
+                    "feature": int(feats[i]),
+                    "rows": int(counts[i]),
+                    "tercile": tercile,
+                }
+            )
+    return picked
+
+
 def sample_tokens(meta: dict[str, Any], n: int, seed: int) -> list[int]:
     """Uniform token_idx sample over [0, n_tokens_encoded)."""
     n_tokens = int(meta["n_tokens_encoded"])
