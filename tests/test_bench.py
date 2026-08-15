@@ -33,6 +33,61 @@ def _run(store: Path, out: Path, *extra: str) -> int:
     )
 
 
+def test_bench_end_to_end_writes_both_outputs(
+    store: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    out = tmp_path / "bench.json"
+    # threshold 0: the tiny store cannot honestly hit 5x.
+    rc = _run(store, out, "--kill-threshold", "0")
+    assert rc == 0
+    assert "PASS" in capsys.readouterr().out
+    assert out.exists() and out.with_suffix(".md").exists()
+
+    payload = json.loads(out.read_text())
+    assert payload["cache_drop_method"] in ("drop_caches", "fadvise", "none")
+    assert len(payload["sampling"]["features"]) == 3
+    assert len(payload["sampling"]["tokens"]) == 3
+    res = payload["results"]
+    assert set(res) == {"tokens_for_feature", "features_for_token"}
+    assert set(res["tokens_for_feature"]) == {
+        "bucketed", "token_bucketed_scan", "flat_pyarrow", "flat_duckdb",
+    }
+    assert set(res["features_for_token"]) == {
+        "token_bucketed", "feature_bucketed_scan", "flat_pyarrow",
+        "flat_duckdb",
+    }
+    for methods in res.values():
+        for temps in methods.values():
+            for temp in ("cold", "warm"):
+                agg = temps[temp]["agg"]
+                assert agg["n_samples"] == 3  # 3 keys x 1 trial
+                for k in ("p50_s", "p90_s", "p99_s", "mean_s"):
+                    assert agg[k] >= 0.0
+                assert agg["rows_mean"] > 0
+                assert len(temps[temp]["samples"]) == 3
+    # env capture is recorded
+    assert payload["env"]["duckdb"]
+    assert payload["env"]["pyarrow"]
+
+    md = out.with_suffix(".md").read_text()
+    assert "tokens_for_feature (cold)" in md
+    assert "| bucketed |" in md
+    assert "Kill point" in md
+
+
+def test_killpoint_fires_but_outputs_survive(
+    store: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    out = tmp_path / "bench.json"
+    rc = _run(store, out, "--kill-threshold", "1e9")
+    assert rc == 2
+    assert "Diagnosis" in capsys.readouterr().out
+    assert out.exists() and out.with_suffix(".md").exists()
+    payload = json.loads(out.read_text())
+    assert payload["killpoint"]["passed"] is False
+    assert "Diagnosis" in payload["killpoint"]["message"]
+
+
 def test_sampling_is_stratified_by_tercile(store: Path):
     picked = bench.sample_features(
         store / queries.BUCKETED_SUBDIR, 6, seed=1
