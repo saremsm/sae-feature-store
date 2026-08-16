@@ -20,6 +20,10 @@ store/
   dump.py         Dump: sequential GPU encode -> work/flat/ staging Parquet
   partition.py    Partitioning: DuckDB bucketing of the flat rows by feature (or
                   token_idx) range -> work/bucketed/, work/bucketed_by_token/
+  queries.py      Benchmark: the two canonical queries on the bucketed layouts +
+                  flat-scan baselines (pyarrow + DuckDB), with timing and
+                  touched-bytes accounting
+  bench.py        Benchmark: cold/warm benchmark harness -> results/bench.json + .md
 tests/            CPU-only tests (fake SAE repo + fake model; one skippable
                   real-GPT-2 test)
 work/             (gitignored) flat/ staging; bucketed/ + bucketed_by_token/
@@ -173,6 +177,64 @@ exactly one (correct) bucket, per-file sort order, row-group statistics
 present and non-overlapping, and stats.json still true; it exits non-zero on
 any violation and logs the mean row-groups-touched-per-feature.
 
+the benchmark benchmarking on the host (CPU-only; root recommended so cold trials can
+`echo 3 > /proc/sys/vm/drop_caches`):
+
+```bash
+sudo -E python -m store.bench --store work/ \
+  --n-features 20 --n-tokens 20 --trials 5 --out results/bench.json
+```
+
+`store.queries` implements both canonical queries and the baselines:
+`tokens_for_feature(store, f, layout="bucketed")` reads only feature `f`'s
+partition (via `bucket_map.json`) through `pyarrow.dataset` with
+`filter=(feature == f)`, so row groups whose min/max exclude `f` are
+skipped; `layout="token"` runs the same filter as a scan of every token
+bucket (the mismatched layout). `features_for_token(store, t,
+layout="token")` reads one token partition; `layout="bucketed"` scans every
+feature bucket - that is the point. Baselines run the same filters over
+`work/flat`: `flat_scan_*` via `pyarrow.dataset` (full scan with predicate
+pushdown but no useful partitioning) and `duckdb_scan_*` via
+`SELECT ... FROM read_parquet('work/flat/rows-*.parquet') WHERE col = ?`.
+Every function returns `(table, elapsed_s, bytes_read)` (a `QueryResult`
+also carrying files/row-groups touched). Timing covers only the filtered
+read; touched bytes come from a post-timing parquet-footer pass (compressed
+column-chunk sizes of admissible row groups) for the pyarrow paths and from
+`os.stat` of the scanned files - an upper bound - for DuckDB, which does
+not expose what it read. Note the flat set is written in token order, so
+its per-row-group `token_idx` min/max are tight and the *token* query
+prunes well even on flat; the layouts truly separate on the *feature*
+query. Spot checks:
+`python -m store.queries --store work/ --query tokens-for-feature --key 123`
+(`--layout`, `--baseline flat-pyarrow|flat-duckdb`).
+
+`store.bench` protocol: the feature sample is stratified by frequency  - 
+bottom/middle/top terciles of rows-per-feature. `stats.json` carries only
+per-bucket aggregates, so the per-feature counts are measured with one
+DuckDB `GROUP BY feature` pass over the bucketed set and cross-checked
+against `stats.json`'s totals before use; the token sample is uniform over
+`[0, n_tokens_encoded)`. Before any timing, every sampled key is answered
+by every method and the row sets must be identical (hard assert). Cold
+trials: before each cold measurement, `sync` + write 3 to
+`/proc/sys/vm/drop_caches` (root); without root the fallback is
+`os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` on every parquet file in
+the store, and on platforms without fadvise (the Windows dev box) nothing
+is dropped - the method actually used is recorded in the results as
+`cache_drop_method` (`drop_caches` | `fadvise` | `none`) and the report
+warns when cold is not cold. Warm trials repeat the same query immediately.
+Recorded per query type x method x temperature: p50/p90/p99/mean latency,
+rows returned, bytes read, files and row groups touched; plus hardware
+(`lsblk -d -o NAME,ROTA,MODEL`, CPU model, RAM) and DuckDB/pyarrow
+versions. Outputs `results/bench.json` and `results/bench.md`, written
+*before* the kill-point check so a failed gate still leaves evidence.
+
+**Kill point:** if the bucketed layout's cold p99 for `tokens_for_feature`
+is not >= 5x (`--kill-threshold`) faster than the flat pyarrow scan's cold
+p99, the bench prints a diagnosis (bucket too coarse? row groups too large
+vs rows returned? feature filter not pushing down? cold not actually cold?)
+and exits 2. Other flags: `--seed`, `--cache-drop
+auto|drop_caches|fadvise|none`.
+
 Tests (CPU, no GPU or network needed; the one real-GPT-2 test skips itself
 if GPT-2 can't be loaded):
 
@@ -236,3 +298,40 @@ python -m pytest -q
     delta-friendly), the feature layout ~20% worse (sorting by feature
     scrambles `token_idx`, the widest column). Expected, and the price of
     1-partition feature lookups.
+- **Benchmark** (verified on the host): `store.queries` +
+  `store.bench` - canonical queries with per-query cost accounting,
+  cold/warm benchmark with stratified sampling, correctness cross-check,
+  hardware capture, JSON + markdown reports, and the 5x kill-point gate.
+  28 new CPU tests (73 pass + 1 skippable real-GPT-2), green on both the
+  Windows dev box and the Lambda box.
+
+  Measured benchmark run (`results/bench.{json,md}`; 20 features stratified by
+  frequency tercile + 20 uniform tokens, 5 cold+warm trials each, root
+  `drop_caches` before every cold trial; Xeon 8358 x30, 222 GB RAM,
+  DuckDB 1.5.5 / pyarrow 25.0.1):
+
+  - **Kill point PASS: 23.1x** - `tokens_for_feature` cold p99 0.081 s
+    bucketed vs 1.863 s flat pyarrow scan (p50: 0.053 s vs 1.464 s; warm
+    p50: 0.015 s vs 1.016 s, ~71x). Against the tougher flat baseline 
+    (DuckDB, cold p99 1.408 s) the speedup is still 17.4x - both flat 
+    engines lose the same way. All four methods returned identical
+    row sets for every sampled key before timing.
+  - The mechanism, from the recorded cost columns: a bucketed feature
+    query touches **1 file / 1.1 row groups / 7.1 MiB** (matching the partition's
+    population mean of 1.157 row groups per feature) vs the flat scan's
+    20 files / 1,046 row groups / 5.5 GiB - pushdown prunes nothing on
+    token-ordered flat files. ~790x fewer bytes buys ~23-27x latency; the
+    remainder is fixed footer + one-row-group decode cost.
+  - Mirror image confirmed: `features_for_token` on the token layout is
+    26 ms cold / 11 ms warm (1 file / 1 row group / 4.5 MiB, exactly 32
+    rows every time at k=32), vs **1.57 s** scanning the feature layout
+    (~61x). And the feature query over the token layout costs 1.55 s  - 
+    as bad as no layout. Neither layout serves both queries; each is
+    ~20-60x on its own.
+  - Predicted quirk, measured: flat pyarrow answers the *token* query in
+    39 ms cold - the flat set is token-ordered, so `token_idx` statistics
+    prune 1,045/1,046 row groups. The token layout still wins (1 footer
+    vs 20) but is cheap insurance; the feature layout is the essential
+    one. Caveat: `lsblk` shows `ROTA=1` on the virtio disks, which often
+    misreports - cold absolutes stand on the drop_caches protocol, not
+    on a device claim.
