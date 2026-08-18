@@ -207,3 +207,113 @@ def section_provenance(bench: dict[str, Any], meta: dict[str, Any]) -> list[str]
     return lines
 
 
+def section_scale(
+    meta: dict[str, Any],
+    stats: dict[str, Any],
+    token_stats: dict[str, Any] | None,
+    flat_bytes: int,
+    flat_files: int,
+) -> list[str]:
+    n_rows = int(meta["n_rows"])
+    n_tokens = int(meta["n_tokens_encoded"])
+    n_features = _n_features(meta)
+    dense_bytes = n_tokens * n_features * 2  # fp16
+
+    lines = [
+        "## Scale",
+        "",
+        f"- rows: **{fmt_int(n_rows)}** over **{fmt_int(n_tokens)}** tokens"
+        f" x **{fmt_int(n_features)}** features, mean L0"
+        f" **{float(meta['mean_l0']):g}**",
+        f"- dense baseline: {fmt_int(n_tokens)} tokens x {fmt_int(n_features)}"
+        f" features x 2 B (fp16) = **{fmt_int(dense_bytes)} B**"
+        f" ({fmt_bytes_binary(dense_bytes)})",
+        "",
+        "| layout | files | row groups | on-disk bytes | size | bytes/row"
+        " | x smaller than dense | size vs flat |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+
+    def row(
+        label: str,
+        nbytes: int,
+        files: str,
+        row_groups: str,
+    ) -> str:
+        return (
+            f"| {label} | {files} | {row_groups} | {fmt_int(nbytes)}"
+            f" | {fmt_bytes_binary(nbytes)} | {_ratio(nbytes, n_rows):.2f}"
+            f" | {_ratio(dense_bytes, nbytes):.1f}x"
+            f" | {_ratio(nbytes, flat_bytes):.2f}x |"
+        )
+
+    lines.append(
+        f"| dense fp16 (hypothetical) | - | - | {fmt_int(dense_bytes)}"
+        f" | {fmt_bytes_binary(dense_bytes)}"
+        f" | {_ratio(dense_bytes, n_rows):.2f} | 1.0x"
+        f" | {_ratio(dense_bytes, flat_bytes):.2f}x |"
+    )
+    lines.append(row("flat (token order)", flat_bytes, str(flat_files), "-"))
+    lines.append(
+        row(
+            "feature-bucketed",
+            int(stats["total_bytes"]),
+            str(int(stats["n_files"])),
+            str(int(stats["n_row_groups"])),
+        )
+    )
+    if token_stats is not None:
+        lines.append(
+            row(
+                "token-bucketed",
+                int(token_stats["total_bytes"]),
+                str(int(token_stats["n_files"])),
+                str(int(token_stats["n_row_groups"])),
+            )
+        )
+    else:
+        log.warning("token-bucketed stats missing; omitting its scale row")
+    return lines
+
+
+def _latency_table(methods: dict[str, Any], query: str, temp: str) -> list[str]:
+    order = list(_METHOD_ORDER.get(query, []))
+    known = {key for key, _ in order}
+    order += [(key, key) for key in methods if key not in known]
+
+    lines = [_LATENCY_HEADER, _LATENCY_RULE]
+    for key, label in order:
+        if key not in methods:
+            log.warning("bench.json has no %s/%s results; row omitted", query, key)
+            continue
+        agg = methods[key][temp]["agg"]
+        lines.append(
+            f"| {label} | {agg['p50_s']:.4f} | {agg['p90_s']:.4f}"
+            f" | {agg['p99_s']:.4f} | {agg['mean_s']:.4f}"
+            f" | {fmt_int(agg['rows_mean'])}"
+            f" | {fmt_bytes_binary(agg['bytes_read_mean'])}"
+            f" | {agg['files_touched_mean']:.0f}"
+            f" | {_fmt_row_groups(agg.get('row_groups_touched_mean'))} |"
+        )
+    return lines
+
+
+def section_latency(bench: dict[str, Any]) -> list[str]:
+    lines = ["## Query latency"]
+    for query in ("tokens_for_feature", "features_for_token"):
+        if query not in bench.get("results", {}):
+            raise ReportError(f"bench.json has no results for {query!r}")
+        for temp in ("cold", "warm"):
+            lines += ["", f"### {query} ({temp})", ""]
+            lines += _latency_table(bench["results"][query], query, temp)
+    kp = bench.get("killpoint")
+    if kp is not None:
+        lines += [
+            "",
+            "### Kill point",
+            "",
+            f"- {kp['message']}",
+        ]
+    return lines
+
+
