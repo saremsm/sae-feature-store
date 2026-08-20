@@ -1,232 +1,232 @@
 # sae-feature-store
 
-Columnar store for sparse autoencoder feature activations. Encodes held-out
-tokens with a trained SAE from the sibling `sae-gpt2-small` project, writes
-`(token_idx, feature, value)` rows to Parquet (zstd), and - in later stages  - 
-buckets them by feature index and benchmarks the two canonical query shapes.
+A columnar store for sparse autoencoder feature activations at the ~1B-row
+scale, plus a benchmark of the two canonical query shapes. It encodes a
+held-out token shard with a trained SAE from the sibling `sae-gpt2-small`
+project, writes one `(token_idx uint32, feature uint32, value float32)` row
+per active feature to Parquet (zstd), and materializes the same rows three
+ways -- flat token-order staging, feature-bucketed, token-bucketed -- to
+measure what each layout buys.
 
-Target scale: >= 1B rows minimum (met: see Status), ~5B rows if a 200M-token
-held-out shard is ever generated. The current holdout shard is 32,099,758
-BOS-excluded stream tokens; `--n-tokens` beyond that caps with a warning. All
-bulk output lives under `./work/` (gitignored) on local NVMe. Runs on Python
-3.10+ (both dev machines use 3.10).
+The data: GPT-2-small residual stream at layer 8 (`blocks.8.hook_resid_post`),
+encoded by the `topk_x8_k32` checkpoint (top-k SAE, expansion 8, k=32,
+6,144 features) over the held-out shard `holdout.bin` -- 252,754 sequences of
+128 tokens from `monology/pile-uncopyrighted` docs [0, 20000), of which
+**32,099,758** BOS-excluded tokens were encoded. Top-k with no dead features
+means exactly k rows per token, so mean L0 is exactly **32.0** and the store
+holds 32,099,758 x 32 = **1,027,192,256** rows.
+
+All numeric tables below are generated from the measured artifacts
+(`results/bench.json`, `work/bucketed/stats.json` + `meta.json`,
+`work/bucketed_by_token/stats.json`) by `python -m store.report`; rebuild
+them with `python -m store.report > README_tables.md`.
+
+## Provenance
+
+- bench run: 2026-08-16T00:29:54+00:00; store `work`; args: 20 features x 20 tokens x 5 trials, seed 0
+- cache drop before each cold trial: **drop_caches**
+- host: Intel(R) Xeon(R) Platinum 8358 CPU @ 2.60GHz x30, 222.2 GiB RAM
+- versions: python 3.10.12, duckdb 1.5.5, pyarrow 25.0.1
+- source data: checkpoint `topk_x8_k32` (sha256 f78463dd1520...), hook `blocks.8.hook_resid_post`, shard `holdout.bin`
+
+## Scale
+
+- rows: **1,027,192,256** over **32,099,758** tokens x **6,144** features, mean L0 **32**
+- dense baseline: 32,099,758 tokens x 6,144 features x 2 B (fp16) = **394,441,826,304 B** (367.4 GiB)
+
+| layout | files | row groups | on-disk bytes | size | bytes/row | x smaller than dense | size vs flat |
+|---|---|---|---|---|---|---|---|
+| dense fp16 (hypothetical) | - | - | 394,441,826,304 | 367.4 GiB | 384.00 | 1.0x | 67.12x |
+| flat (token order) | 20 | - | 5,876,266,151 | 5.5 GiB | 5.72 | 67.1x | 1.00x |
+| feature-bucketed | 128 | 1091 | 6,860,123,529 | 6.4 GiB | 6.68 | 57.5x | 1.17x |
+| token-bucketed | 128 | 1152 | 5,237,653,842 | 4.9 GiB | 5.10 | 75.3x | 0.89x |
+
+Reading the table: sparsity is doing almost all the work -- storing only the
+~0.52% of (token, feature) cells that are nonzero (32 of 6,144) shrinks the
+data 57-75x versus a dense fp16 matrix, and zstd on top gets the flat layout
+to 5.72 B/row against 12 B/row uncompressed (~2.1x). The feature-bucketed
+copy is 1.17x the flat bytes because its `(feature, token_idx)` sort
+scrambles `token_idx`, the widest and previously delta-friendly column; the
+token-bucketed copy keeps the dump order and compresses best at 5.10 B/row.
 
 ## Layout
 
-```
-store/
-  sae_import.py   import shim for ~/sae-gpt2-small (the ONLY sys.path toucher)
-  schema.py       Arrow schemas, layout constants, the token_idx mapping
-  dump.py         Dump: sequential GPU encode -> work/flat/ staging Parquet
-  partition.py    Partitioning: DuckDB bucketing of the flat rows by feature (or
-                  token_idx) range -> work/bucketed/, work/bucketed_by_token/
-  queries.py      Benchmark: the two canonical queries on the bucketed layouts +
-                  flat-scan baselines (pyarrow + DuckDB), with timing and
-                  touched-bytes accounting
-  bench.py        Benchmark: cold/warm benchmark harness -> results/bench.json + .md
-tests/            CPU-only tests (fake SAE repo + fake model; one skippable
-                  real-GPT-2 test)
-work/             (gitignored) flat/ staging; bucketed/ + bucketed_by_token/
-results/          committed benchmark outputs (numbers come only from real runs)
-```
+Both bucketed layouts are hive-partitioned into 128 directories
+(`bucket=NN/data_0.parquet`), one file per bucket, 1,000,000-row groups,
+zstd. The feature layout assigns `bucket = (feature * 128) // 6144`, so each
+bucket holds a contiguous range of 6,144 / 128 = 48 features, and every file
+is sorted by `(feature, token_idx)`. The token layout is the mirror image:
+`bucket = (token_idx * 128) // 32099758`, files sorted by
+`(token_idx, feature)`.
 
-## The `--sae-repo` contract
+The point of bucket + sort + bounded row groups is that a point lookup never
+opens what it does not need. Partition pruning via `bucket_map.json` picks
+the single file whose key range contains the key, and inside that file the
+sort makes each row group's min/max statistics for the key column tight and
+non-overlapping, so the reader admits only the row group(s) that can contain
+the key and predicate pushdown skips the rest without decoding them. At 48
+features and ~8.0M rows (1,027,192,256 / 128) per bucket, a bucket spans
+~8.5 row groups, so most features sit inside a single row group; the
+measured population mean is **1.157 row groups touched per feature** (963
+boundary-straddling pairs). The token layout hits exactly **1.000**: at k=32
+rows per token, a 1,000,000-row group holds exactly 31,250 whole tokens, so
+row-group cuts always land on token boundaries. Sort order is enforced by a
+finalize pass after DuckDB's partitioned COPY (which does not preserve ORDER
+BY inside partitions -- on the host, all 128 came back unsorted) and
+re-verified by `python -m store.partition --check`.
 
-The SAE project lives at `~/sae-gpt2-small` on the GPU box and is **not**
-pip-installed. Every entry point takes `--sae-repo` (default: the `SAE_REPO`
-env var, else `~/sae-gpt2-small`). Exactly one module  - 
-`store/sae_import.py` - inserts that path into `sys.path` and imports
-`SparseAutoencoder` (from `sparse_autoencoder.py`) plus `TokenShard` /
-`ActivationLoader` (from `data.py`) and `evaluate` when present. No other
-file touches `sys.path`. If the path or an expected symbol is missing you get
-an actionable error naming the file it expected and telling you to pass
-`--sae-repo`.
+## Query latency
 
-Tests never need the real repo: they either write a tiny fake repo to a temp
-directory and point `--sae-repo` at it, or pass a pre-built `SAEModules`
-namespace (and a fake model) directly into `store.dump.main(...)`.
+### tokens_for_feature (cold)
 
-The store only ever reads the shard **sequentially** - the SAE repo's
-shuffling ring-buffer loader is deliberately unused - so `token_idx` is
-monotone and reproducible run-to-run.
+| method | p50 (s) | p90 (s) | p99 (s) | mean (s) | rows | bytes read | files | row groups |
+|---|---|---|---|---|---|---|---|---|
+| feature-bucketed | 0.0532 | 0.0633 | 0.0807 | 0.0538 | 134,704 | 7.1 MiB | 1 | 1.1 |
+| token-bucketed scan | 1.5539 | 1.5727 | 1.8511 | 1.5629 | 134,704 | 4.8 GiB | 128 | 1152.0 |
+| flat scan (pyarrow) | 1.4643 | 1.4881 | 1.8632 | 1.4756 | 134,704 | 5.5 GiB | 20 | 1046.0 |
+| flat scan (DuckDB) | 1.1239 | 1.2767 | 1.4078 | 1.1266 | 134,704 | 5.5 GiB | 20 | - |
 
-## Data model
+### tokens_for_feature (warm)
 
-Written by `store.dump` into `--out` (e.g. `work/flat/`):
+| method | p50 (s) | p90 (s) | p99 (s) | mean (s) | rows | bytes read | files | row groups |
+|---|---|---|---|---|---|---|---|---|
+| feature-bucketed | 0.0149 | 0.0166 | 0.0200 | 0.0142 | 134,704 | 7.1 MiB | 1 | 1.1 |
+| token-bucketed scan | 1.1949 | 1.2105 | 1.2228 | 1.1954 | 134,704 | 4.8 GiB | 128 | 1152.0 |
+| flat scan (pyarrow) | 1.0155 | 1.0354 | 1.0523 | 1.0168 | 134,704 | 5.5 GiB | 20 | 1046.0 |
+| flat scan (DuckDB) | 0.5349 | 0.6978 | 0.8425 | 0.5335 | 134,704 | 5.5 GiB | 20 | - |
 
-- `rows-NNNNN.parquet` - one row per (token, active feature):
-  `token_idx uint32, feature uint32, value float32`. ~50M rows per file,
-  1M-row groups, zstd. `feature_bucket` is *not* stored; it is derived from
-  `feature` in partitioning bucketing stage.
-- `tokens-NNNNN.parquet` - one row per encoded token:
-  `token_idx uint32, seq_idx uint32, pos uint16, token_id uint16`, so
-  "features at token t" can be decoded back to text later.
-- `meta.json` - checkpoint path + sha256, normalized SAE config (activation,
-  k / l1_coeff, expansion, n_features, input_scale, plus the raw config
-  dict), hook name, shard path + sidecar contents, n_tokens encoded, n_rows,
-  mean L0, rows_per_file, row_group_size, created_at, git SHAs of both
-  repos, and the completed-segment list `--resume` uses.
+### features_for_token (cold)
 
-**token_idx** is the index of a token in the sequential, BOS-excluded stream
-over the held-out shard (`[n_seqs, seq_len]`, BOS at position 0 of every
-sequence):
+| method | p50 (s) | p90 (s) | p99 (s) | mean (s) | rows | bytes read | files | row groups |
+|---|---|---|---|---|---|---|---|---|
+| token-bucketed | 0.0255 | 0.0491 | 0.0514 | 0.0295 | 32 | 4.5 MiB | 1 | 1.0 |
+| feature-bucketed scan | 1.5659 | 1.6017 | 1.6158 | 1.5686 | 32 | 5.7 GiB | 128 | 968.6 |
+| flat scan (pyarrow) | 0.0390 | 0.0691 | 0.0737 | 0.0415 | 32 | 5.0 MiB | 1 | 1.0 |
+| flat scan (DuckDB) | 0.1532 | 0.1565 | 0.1624 | 0.1531 | 32 | 5.5 GiB | 20 | - |
 
-```
-token_idx = seq_idx * (seq_len - 1) + (pos - 1)        # 1 <= pos < seq_len
-```
+### features_for_token (warm)
 
-The mapping (and its inverse) is a pure function in `store/schema.py`
-(`token_index` / `token_to_seq_pos`); `store.dump` asserts against it on
-every batch, so the ROWS and TOKENS tables cannot disagree.
+| method | p50 (s) | p90 (s) | p99 (s) | mean (s) | rows | bytes read | files | row groups |
+|---|---|---|---|---|---|---|---|---|
+| token-bucketed | 0.0108 | 0.0128 | 0.0138 | 0.0109 | 32 | 4.5 MiB | 1 | 1.0 |
+| feature-bucketed scan | 1.1437 | 1.1619 | 1.1740 | 1.1418 | 32 | 5.7 GiB | 128 | 968.6 |
+| flat scan (pyarrow) | 0.0167 | 0.0229 | 0.0249 | 0.0173 | 32 | 5.0 MiB | 1 | 1.0 |
+| flat scan (DuckDB) | 0.1198 | 0.1215 | 0.1252 | 0.1200 | 32 | 5.5 GiB | 20 | - |
 
-Written by `store.partition` into `--out` (e.g. `work/bucketed/`):
+### Kill point
 
-- `bucket=NN/data_*.parquet` - hive-partitioned rows, same three columns.
-  `bucket` lives only in the directory name, never inside the files; read
-  the dataset back with `read_parquet(..., hive_partitioning=1)`. Bucket
-  `b` holds the contiguous feature range
-  `[ceil(b*n_features/n_buckets), ceil((b+1)*n_features/n_buckets))` via
-  `bucket = feature * n_buckets // n_features`, and every file is sorted by
-  `(feature, token_idx)`, so a single-feature lookup touches exactly one
-  partition and skips row groups via their min/max `feature` statistics.
-  Adjacent row groups may share the one boundary feature that straddles a
-  row-group cut; the check enforces `max(rg_i) <= min(rg_{i+1})`.
-- `bucket_map.json` - layout, key column, `n_buckets`, key domain, the
-  bucket SQL expression, and every bucket's `[lo, hi)` key range.
-- `stats.json` - per-bucket rows, bytes, features, min/max rows per
-  feature, files, row groups; plus totals and the measured mean
-  row-groups-touched-per-feature.
-- `meta.json` - the flat set's meta copied forward with a `partition` block
-  added (layout, n_buckets, domain, bucket expr, row_group_size, threads,
-  memory_limit, per_bucket_passes, source flat dir + measured
-  `source_rows`, created_at).
+- KILL-POINT tokens_for_feature cold p99: bucketed 0.0807s vs flat scan 1.8632s -> 23.1x (threshold >= 5.0x): PASS
 
-`--layout token` produces the same on-disk shape with `token_idx` as the
-bucketing key (domain = `n_tokens_encoded`, files sorted by
-`(token_idx, feature)`, stats fields named per token), written to
-`work/bucketed_by_token/`. **Tradeoff:** the feature-bucketed layout answers
-"all tokens where feature f fires" from one partition but scatters "all
-features at token t" across every bucket; the token-bucketed layout is the
-mirror image. Neither layout is right for both canonical queries - that is
-the point, and the benchmark benchmark will show it.
+Read together: each layout wins exactly the query it was sorted for,
+and loses the other one badly. `tokens_for_feature` on the feature layout
+touches 1 file / ~1.1 row groups / 7.1 MiB versus the flat scan's 20 files /
+1,046 row groups / 5.5 GiB -- ~786x fewer bytes read for 27.5x cold p50
+(1.4643 s -> 0.0532 s), 23.1x cold p99 (the kill-point gate, threshold 5x),
+and ~68x warm p50; the speedup is smaller than the byte ratio because a
+fixed footer-read + row-group-decode cost -- roughly the bucketed warm p50,
+~15 ms -- does not shrink with the bytes. It also beats
+the stronger flat baseline: DuckDB's parallel scan cuts the flat cold p99 to
+1.4078 s, still 17.4x slower than the bucketed read. The shape the feature
+layout is bad at is `features_for_token`: 32 rows cost a 128-file, 5.7 GiB
+scan at 1.57 s cold -- ~61x slower than the token layout's 25 ms, and worse
+than doing no layout work at all, since flat pyarrow answers the same query
+in 39 ms cold. That flat number is not luck: the flat files are written in
+token order, so `token_idx` row-group statistics prune 1,045 of 1,046 row
+groups even without partitioning. The mirror holds too -- the feature query
+over the token layout costs 1.55 s, as bad as a flat scan. Conclusions:
+neither single layout serves both queries; the feature-bucketed copy is the
+essential one (nothing else answers its query fast) while the token-bucketed
+copy is cheap insurance over the already-token-ordered flat set (25 ms vs 39
+ms cold, 1 footer vs 20).
 
-## Commands
+## Scale-up to 1e+12 tokens (EXTRAPOLATED)
 
-Sanity smoke on the host (~1 min), then the full run:
+All numbers in this table are **extrapolated** from the measured bytes/row and mean L0 above; the scale factor over the measured run is 1,000,000,000,000 / 32,099,758 = **31,153x** tokens.
+
+| quantity (extrapolated) | value | arithmetic |
+|---|---|---|
+| rows | 3.20e+13 | 32 rows/token x 1,000,000,000,000 tokens |
+| feature-bucketed storage | 213.7 TB | 6.6785 B/row x 3.20e+13 rows |
+| flat storage | 183.1 TB | 5.7207 B/row x 3.20e+13 rows |
+| token-bucketed storage | 163.2 TB | 5.0990 B/row x 3.20e+13 rows |
+| dense fp16 baseline | 12,288.0 TB | 1,000,000,000,000 x 6,144 x 2 B |
+| rows per feature (mean) | 5.21e+09 | 3.20e+13 / 6,144 features |
+| row groups per feature (mean) | 5,208 | 5.21e+09 / 1,000,000-row groups |
+| cold read per mean feature query | 34.8 GB | 213.7 TB / 6,144 features |
+| per-bucket file at 128 buckets | 1.7 TB | 213.7 TB / 128 |
+| ingest sort input (uncompressed) | 384.0 TB | 3.20e+13 rows x 12 B |
+
+How the two queries change (extrapolated): `tokens_for_feature` stops being
+a point read. A mean feature's rows grow with its frequency -- 31,153x more
+tokens means ~5.2e9 rows and ~35 GB compressed (extrapolated) for the mean
+feature, spread over ~5,208 row groups -- so cold latency becomes
+sequential-read bound and scales linearly with feature frequency; rare
+features stay cheap. `features_for_token` stays
+O(k): 32 rows in one row group in one file regardless of corpus size,
+provided partition count grows so per-file row-group counts (and footers)
+stay bounded -- its cost is a footer plus one row-group decode, roughly the
+constant measured here.
+
+What breaks, in order: (1) per-bucket file sizes -- at 128 buckets each
+partition is a ~1.7 TB (extrapolated) Parquet file holding ~250,000
+1M-row groups (3.20e+13 rows / 128 buckets / 10^6); footers alone become a
+problem, so bucket count must scale with data. (2)
+The ingest sort -- the measured run globally sorted 12.3 GB uncompressed
+(1,027,192,256 x 12 B) inside a 48 GB memory limit; 3.2e13 rows are 384 TB
+(extrapolated) of sort input, far beyond RAM, and the `--per-bucket-passes`
+fallback becomes 128+ full scans of a ~183 TB flat set. (3) `token_idx`
+itself -- one monotone counter over a single shard does not survive many
+ingest batches, and mapping tokens back to documents needs an explicit
+token -> (shard, doc, position) index rather than arithmetic.
+
+The design that fixes it: partition first by document/time range -- each
+ingest shard (say 10^9-10^10 tokens) is dumped, sorted, and feature-bucketed
+independently, so every sort is the size measured here and ingest is
+append-only with no global reshuffle. Within a range, keep the feature
+buckets; across ranges, maintain a per-feature secondary index mapping
+feature -> (range, file, row-group / byte extent), so `tokens_for_feature`
+issues targeted range reads across shards instead of consulting thousands of
+footers, and can read only the ranges a caller asks for. Add the token ->
+document index as a small per-range table (the `tokens-*.parquet` sidecars
+already hold the mapping), and tier the ranges: recent/hot on NVMe, the long
+tail in object storage, with the secondary index deciding what to fetch.
+
+## Reproduce
+
+The four commands (GPU box; `--sae-repo` defaults to `~/sae-gpt2-small`,
+override via flag or the `SAE_REPO` env var -- `store/sae_import.py` is the
+only module that touches `sys.path`):
 
 ```bash
+# 1. encode the holdout shard -> flat staging Parquet (GPU, ~8 min)
 python -m store.dump \
-  --checkpoint ~/sae-gpt2-small/results/frontier/<best>/checkpoint.pt \
-  --shard ~/sae-gpt2-small/data/holdout.bin \
-  --n-tokens 2000000 --out work/flat_smoke/
-
-python -m store.dump \
-  --checkpoint ~/sae-gpt2-small/results/frontier/<best>/checkpoint.pt \
+  --checkpoint ~/sae-gpt2-small/results/frontier/topk_x8_k32/checkpoint.pt \
   --shard ~/sae-gpt2-small/data/holdout.bin \
   --n-tokens 200000000 --out work/flat/ \
   --batch-seqs 512 --rows-per-file 50000000
-```
 
-Useful flags: `--sae-repo` (see contract above), `--resume` (continue an
-interrupted run; complete files are skipped based on `meta.json`),
-`--encode-chunk` (tokens per `sae.encode` call - caps the dense activation
-buffer; lower it if the SAE is wide and GPU memory is tight), `--device`,
-`--layer` / `--hook-name` (default: the checkpoint's layer, else 8, at
-`blocks.<layer>.hook_resid_post`).
-
-The dump loads GPT-2-small via transformer_lens, runs to the residual hook
-with `stop_at_layer` under `torch.no_grad()` (bf16 autocast on CUDA, fp32
-into the SAE), and logs tokens/s and rows/s as it goes - this step is
-GPU-forward-bound. At the end it hard-asserts `rows written == sum of
-per-token L0` accumulated on the device, and warns (never fails) if mean L0
-deviates >5% from the checkpoint's `metrics.json`.
-
-partitioning partitioning on the host (CPU-only; ~1B rows fits the 48 GB sort budget
-with huge headroom on the 222 GB machine):
-
-```bash
+# 2. feature-bucketed layout (CPU)
 python -m store.partition --flat work/flat/ --out work/bucketed/ \
   --n-buckets 128 --row-group-size 1000000 --threads 16 --memory-limit 48GB
 
+# 3. token-bucketed layout (CPU)
 python -m store.partition --flat work/flat/ --out work/bucketed_by_token/ \
   --layout token \
   --n-buckets 128 --row-group-size 1000000 --threads 16 --memory-limit 48GB
 
-python -m store.partition --check work/bucketed/
-python -m store.partition --check work/bucketed_by_token/
-```
-
-The default path is one DuckDB `COPY ... PARTITION_BY (bucket)` over a
-global `ORDER BY bucket, feature, token_idx` (spill dir: `--temp-dir`,
-default `<out>/_duckdb_tmp`, i.e. under `work/`), followed by a finalize
-pass that leaves every partition as a single sorted `data_0.parquet`  - 
-necessary because DuckDB's multi-threaded hive-partitioned COPY does *not*
-preserve the ORDER BY inside partition files (measured on 1.5.5: several of
-128 partitions come back unsorted at `--threads 4`+); partitions that
-already arrive as one sorted file are detected cheaply and left untouched.
-`--per-bucket-passes`
-instead runs one `WHERE bucket = i` pass per bucket: n_buckets scans of the
-flat set, but each sort holds only ~1/n_buckets of the rows. Use it only if
-the global sort exceeds `--memory-limit` (the hypothetical ~5B-row / 200M
-token case); at the measured 1.03B rows the global sort fits in RAM and the
-single pass is faster. Both paths produce byte-for-row identical, identically
-ordered partitions (tested). Reruns into an existing `--out` first clear old
-`bucket=*` dirs, so stale files never mix in. `--check <dir>` re-verifies an
-existing dataset: row totals vs the recorded source count, every feature in
-exactly one (correct) bucket, per-file sort order, row-group statistics
-present and non-overlapping, and stats.json still true; it exits non-zero on
-any violation and logs the mean row-groups-touched-per-feature.
-
-the benchmark benchmarking on the host (CPU-only; root recommended so cold trials can
-`echo 3 > /proc/sys/vm/drop_caches`):
-
-```bash
+# 4. cold/warm benchmark (root so cold trials can drop_caches)
 sudo -E python -m store.bench --store work/ \
   --n-features 20 --n-tokens 20 --trials 5 --out results/bench.json
 ```
 
-`store.queries` implements both canonical queries and the baselines:
-`tokens_for_feature(store, f, layout="bucketed")` reads only feature `f`'s
-partition (via `bucket_map.json`) through `pyarrow.dataset` with
-`filter=(feature == f)`, so row groups whose min/max exclude `f` are
-skipped; `layout="token"` runs the same filter as a scan of every token
-bucket (the mismatched layout). `features_for_token(store, t,
-layout="token")` reads one token partition; `layout="bucketed"` scans every
-feature bucket - that is the point. Baselines run the same filters over
-`work/flat`: `flat_scan_*` via `pyarrow.dataset` (full scan with predicate
-pushdown but no useful partitioning) and `duckdb_scan_*` via
-`SELECT ... FROM read_parquet('work/flat/rows-*.parquet') WHERE col = ?`.
-Every function returns `(table, elapsed_s, bytes_read)` (a `QueryResult`
-also carrying files/row-groups touched). Timing covers only the filtered
-read; touched bytes come from a post-timing parquet-footer pass (compressed
-column-chunk sizes of admissible row groups) for the pyarrow paths and from
-`os.stat` of the scanned files - an upper bound - for DuckDB, which does
-not expose what it read. Note the flat set is written in token order, so
-its per-row-group `token_idx` min/max are tight and the *token* query
-prunes well even on flat; the layouts truly separate on the *feature*
-query. Spot checks:
-`python -m store.queries --store work/ --query tokens-for-feature --key 123`
-(`--layout`, `--baseline flat-pyarrow|flat-duckdb`).
+Then `python -m store.partition --check work/bucketed/` (and
+`.../bucketed_by_token/`) re-verifies an existing dataset, and
+`python -m store.report > README_tables.md` regenerates every numeric table
+in this README from `results/bench.json` + the `work/` stats/meta. Tests
+(CPU-only, no GPU or network; green on Windows/Git Bash and Linux):
+`python -m pytest -q`.
 
-`store.bench` protocol: the feature sample is stratified by frequency  - 
-bottom/middle/top terciles of rows-per-feature. `stats.json` carries only
-per-bucket aggregates, so the per-feature counts are measured with one
-DuckDB `GROUP BY feature` pass over the bucketed set and cross-checked
-against `stats.json`'s totals before use; the token sample is uniform over
-`[0, n_tokens_encoded)`. Before any timing, every sampled key is answered
-by every method and the row sets must be identical (hard assert). Cold
-trials: before each cold measurement, `sync` + write 3 to
-`/proc/sys/vm/drop_caches` (root); without root the fallback is
-`os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` on every parquet file in
-the store, and on platforms without fadvise (the Windows dev box) nothing
-is dropped - the method actually used is recorded in the results as
-`cache_drop_method` (`drop_caches` | `fadvise` | `none`) and the report
-warns when cold is not cold. Warm trials repeat the same query immediately.
-Recorded per query type x method x temperature: p50/p90/p99/mean latency,
-rows returned, bytes read, files and row groups touched; plus hardware
-(`lsblk -d -o NAME,ROTA,MODEL`, CPU model, RAM) and DuckDB/pyarrow
-versions. Outputs `results/bench.json` and `results/bench.md`, written
-*before* the kill-point check so a failed gate still leaves evidence.
+## Limitations
 
 **Kill point:** if the bucketed layout's cold p99 for `tokens_for_feature`
 is not >= 5x (`--kill-threshold`) faster than the flat pyarrow scan's cold
@@ -335,3 +335,18 @@ python -m pytest -q
     one. Caveat: `lsblk` shows `ROTA=1` on the virtio disks, which often
     misreports - cold absolutes stand on the drop_caches protocol, not
     on a device claim.
+  - Single node, single NVMe-class local disk (`lsblk` reports `ROTA=1` on the
+    virtio devices, which commonly misreports -- cold absolutes rest on the
+    `drop_caches` protocol, not on a device claim). No network storage, no
+    concurrency, no writer/reader contention.
+  - One SAE width (6,144 features) and one sparsity regime (top-k, k=32, so L0
+    is exactly 32 for every token). A ReLU/L1 SAE with heavy-tailed L0, or a
+    much wider SAE, shifts the bucket-balance and bytes/row numbers.
+  - Synthetic query mix: single-key point lookups only (20 features stratified
+    by frequency tercile, 20 uniform tokens, 5 trials each). No range queries,
+    no top-k-by-value, no joins against the token table, no concurrent load.
+  - 32.1M tokens / 1.03B rows measured; every 10^12-token number above is
+    extrapolated arithmetic, labeled as such, not a measurement.
+  - The kill-point ratio (23.1x) compares against a full flat scan; a smarter
+    baseline (e.g. flat data sorted by feature) would narrow it -- that
+    baseline is what the feature-bucketed layout *is*.
