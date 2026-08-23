@@ -1,0 +1,301 @@
+{
+ "format_version": 1,
+ "created_at": "2026-08-17T22:18:05+00:00",
+ "sae_checkpoint": {
+  "path": "/home/ubuntu/sae-gpt2-small/results/frontier/topk_x8_k32/checkpoint.pt",
+  "sha256": "f78463dd1520479632d21e4ec4350d82052db017e12d402d4e05518880d8aa77"
+ },
+ "sae_config": {
+  "activation": "topk",
+  "k": 32,
+  "l1_coeff": 0.0,
+  "expansion": 8.0,
+  "n_features": 6144,
+  "d_model": 768,
+  "input_scale": 0.22821541130542755,
+  "raw": {
+   "d_model": 768,
+   "n_features": 6144,
+   "l1_coefficient": 0.0,
+   "lr": 0.0004,
+   "warmup_steps": 1000,
+   "normalize_decoder": true,
+   "normalize_input": true,
+   "activation": "topk",
+   "k": 32,
+   "aux_k": 64,
+   "aux_coeff": 0.03125,
+   "adam_betas": [
+    0.9,
+    0.99
+   ]
+  }
+ },
+ "hook_name": "blocks.8.hook_resid_post",
+ "layer": 8,
+ "model_name": "gpt2",
+ "shard": {
+  "path": "/home/ubuntu/sae-gpt2-small/data/holdout.bin",
+  "n_seqs": 252754,
+  "seq_len": 128,
+  "source": "memmap",
+  "sidecar": {
+   "n_tokens": 32352512,
+   "n_seqs": 252754,
+   "seq_len": 128,
+   "seed": 0,
+   "dataset": "monology/pile-uncopyrighted",
+   "split": "train",
+   "text_field": "text",
+   "doc_range": [
+    0,
+    20000
+   ],
+   "n_docs": 20000,
+   "tokenizer": "gpt2",
+   "bos_id": 50256,
+   "eos_id": 50256,
+   "dtype": "uint16",
+   "packing": "bos at position 0 of every row; eos between documents"
+  }
+ },
+ "n_tokens_requested": 200000000,
+ "n_tokens_encoded": 32099758,
+ "n_rows": 1027192256,
+ "l0_sum": 1027192256,
+ "mean_l0": 32.0,
+ "rows_per_file": 50000000,
+ "row_group_size": 1000000,
+ "compression": "zstd",
+ "segments": [
+  {
+   "index": 0,
+   "rows_file": "rows-00000.parquet",
+   "tokens_file": "tokens-00000.parquet",
+   "seq_start": 0,
+   "seq_end": 12800,
+   "token_start": 0,
+   "token_end": 1625600,
+   "n_rows": 52019200
+  },
+  {
+   "index": 1,
+   "rows_file": "rows-00001.parquet",
+   "tokens_file": "tokens-00001.parquet",
+   "seq_start": 12800,
+   "seq_end": 25600,
+   "token_start": 1625600,
+   "token_end": 3251200,
+   "n_rows": 52019200
+  },
+  {
+   "index": 2,
+   "rows_file": "rows-00002.parquet",
+   "tokens_file": "tokens-00002.parquet",
+   "seq_start": 25600,
+   "seq_end": 38400,
+   "token_start": 3251200,
+   "token_end": 4876800,
+   "n_rows": 52019200
+  },
+  {
+   "index": 3,
+   "rows_file": "rows-00003.parquet",
+   "tokens_file": "tokens-00003.parquet",
+   "seq_start": 38400,
+   "seq_end": 51200,
+   "token_start": 4876800,
+   "token_end": 6502400,
+   "n_rows": 52019200
+  },
+  {
+   "index": 4,
+   "rows_file": "rows-00004.parquet",
+   "tokens_file": "tokens-00004.parquet",
+   "seq_start": 51200,
+   "seq_end": 64000,
+   "token_start": 6502400,
+   "token_end": 8128000,
+   "n_rows": 52019200
+  },
+  {
+   "index": 5,
+   "rows_file": "rows-00005.parquet",
+   "tokens_file": "tokens-00005.parquet",
+   "seq_start": 64000,
+   "seq_end": 76800,
+   "token_start": 8128000,
+   "token_end": 9753600,
+   "n_rows": 52019200
+  },
+  {
+   "index": 6,
+   "rows_file": "rows-00006.parquet",
+   "tokens_file": "tokens-00006.parquet",
+   "seq_start": 76800,
+   "seq_end": 89600,
+   "token_start": 9753600,
+   "token_end": 11379200,
+   "n_rows": 52019200
+  },
+  {
+   "index": 7,
+   "rows_file": "rows-00007.parquet",
+   "tokens_file": "tokens-00007.parquet",
+   "seq_start": 89600,
+   "seq_end": 102400,
+   "token_start": 11379200,
+   "token_end": 13004800,
+   "n_rows": 52019200
+  },
+  {
+   "index": 8,
+   "rows_file": "rows-00008.parquet",
+   "tokens_file": "tokens-00008.parquet",
+   "seq_start": 102400,
+   "seq_end": 115200,
+   "token_start": 13004800,
+   "token_end": 14630400,
+   "n_rows": 52019200
+  },
+  {
+   "index": 9,
+   "rows_file": "rows-00009.parquet",
+   "tokens_file": "tokens-00009.parquet",
+   "seq_start": 115200,
+   "seq_end": 128000,
+   "token_start": 14630400,
+   "token_end": 16256000,
+   "n_rows": 52019200
+  },
+  {
+   "index": 10,
+   "rows_file": "rows-00010.parquet",
+   "tokens_file": "tokens-00010.parquet",
+   "seq_start": 128000,
+   "seq_end": 140800,
+   "token_start": 16256000,
+   "token_end": 17881600,
+   "n_rows": 52019200
+  },
+  {
+   "index": 11,
+   "rows_file": "rows-00011.parquet",
+   "tokens_file": "tokens-00011.parquet",
+   "seq_start": 140800,
+   "seq_end": 153600,
+   "token_start": 17881600,
+   "token_end": 19507200,
+   "n_rows": 52019200
+  },
+  {
+   "index": 12,
+   "rows_file": "rows-00012.parquet",
+   "tokens_file": "tokens-00012.parquet",
+   "seq_start": 153600,
+   "seq_end": 166400,
+   "token_start": 19507200,
+   "token_end": 21132800,
+   "n_rows": 52019200
+  },
+  {
+   "index": 13,
+   "rows_file": "rows-00013.parquet",
+   "tokens_file": "tokens-00013.parquet",
+   "seq_start": 166400,
+   "seq_end": 179200,
+   "token_start": 21132800,
+   "token_end": 22758400,
+   "n_rows": 52019200
+  },
+  {
+   "index": 14,
+   "rows_file": "rows-00014.parquet",
+   "tokens_file": "tokens-00014.parquet",
+   "seq_start": 179200,
+   "seq_end": 192000,
+   "token_start": 22758400,
+   "token_end": 24384000,
+   "n_rows": 52019200
+  },
+  {
+   "index": 15,
+   "rows_file": "rows-00015.parquet",
+   "tokens_file": "tokens-00015.parquet",
+   "seq_start": 192000,
+   "seq_end": 204800,
+   "token_start": 24384000,
+   "token_end": 26009600,
+   "n_rows": 52019200
+  },
+  {
+   "index": 16,
+   "rows_file": "rows-00016.parquet",
+   "tokens_file": "tokens-00016.parquet",
+   "seq_start": 204800,
+   "seq_end": 217600,
+   "token_start": 26009600,
+   "token_end": 27635200,
+   "n_rows": 52019200
+  },
+  {
+   "index": 17,
+   "rows_file": "rows-00017.parquet",
+   "tokens_file": "tokens-00017.parquet",
+   "seq_start": 217600,
+   "seq_end": 230400,
+   "token_start": 27635200,
+   "token_end": 29260800,
+   "n_rows": 52019200
+  },
+  {
+   "index": 18,
+   "rows_file": "rows-00018.parquet",
+   "tokens_file": "tokens-00018.parquet",
+   "seq_start": 230400,
+   "seq_end": 243200,
+   "token_start": 29260800,
+   "token_end": 30886400,
+   "n_rows": 52019200
+  },
+  {
+   "index": 19,
+   "rows_file": "rows-00019.parquet",
+   "tokens_file": "tokens-00019.parquet",
+   "seq_start": 243200,
+   "seq_end": 252754,
+   "token_start": 30886400,
+   "token_end": 32099758,
+   "n_rows": 38827456
+  }
+ ],
+ "progress": {
+  "seqs_done": 252754,
+  "tokens_done": 32099758,
+  "complete": true,
+  "run_args": {
+   "batch_seqs": 512,
+   "encode_chunk": 16384,
+   "device": "cuda"
+  }
+ },
+ "git": {
+  "feature_store": null,
+  "sae_repo": "569f002073e6b66f1c0a6a4bd4e453f11981d9f6"
+ },
+ "partition": {
+  "layout": "feature",
+  "key": "feature",
+  "secondary_sort": "token_idx",
+  "n_buckets": 128,
+  "domain": 6144,
+  "bucket_expr": "(CAST(feature AS BIGINT) * 128) // 6144",
+  "row_group_size": 1000000,
+  "threads": 16,
+  "memory_limit": "48GB",
+  "per_bucket_passes": false,
+  "source_flat": "work/flat",
+  "source_rows": 1027192256,
+  "created_at": "2026-08-18T01:35:21+00:00"
+ }
+}

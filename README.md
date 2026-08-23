@@ -21,6 +21,8 @@ All numeric tables below are generated from the measured artifacts
 `work/bucketed_by_token/stats.json`) by `python -m store.report`; rebuild
 them with `python -m store.report > README_tables.md`.
 
+Provenance of `work/`: the committed metadata is from the 2026-08-17/18 rebuild of the store (dump then partition, same checkpoint, shard, and pipeline); `results/bench.json` was recorded against the 2026-08-15/16 build of the same inputs. The metas' `git.sae_repo` field records the dump host's checkout and does not resolve in the published history; the checkpoint is identified by its sha256 above.
+
 ## Provenance
 
 - bench run: 2026-08-16T00:29:54+00:00; store `work`; args: 20 features x 20 tokens x 5 trials, seed 0

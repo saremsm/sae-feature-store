@@ -8,3 +8,9 @@ __pycache__/
 venv/
 *.egg-info/
 README_tables.md
+!work/bucketed/stats.json
+!work/bucketed/meta.json
+!work/bucketed/bucket_map.json
+!work/bucketed_by_token/stats.json
+!work/bucketed_by_token/meta.json
+!work/bucketed_by_token/bucket_map.json
